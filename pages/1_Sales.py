@@ -1,0 +1,247 @@
+"""Sales Performance — revenue, orders, and target attainment by branch."""
+from __future__ import annotations
+
+from datetime import date, datetime
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from lib import charts, db, filters, grid, queries, targets, theme
+
+st.set_page_config(page_title="Sales · Denri Sales Operations Dashboard", page_icon="💰", layout="wide")
+
+
+st.title("💰 Sales Performance")
+st.caption("Revenue, orders, and target attainment by branch — live from Postgres")
+
+connected, detail = db.check_connection()
+if not connected:
+    st.error(f"Could not connect to Postgres: {detail}", icon="🚫")
+    st.stop()
+
+col_picker, col_refresh = st.columns([3, 1])
+with col_picker:
+    start_date, end_date = filters.date_range_control("sales")
+
+
+# One colour per sales channel, the same in every chart on this page.
+CHANNEL_COLORS = {
+    "Walk-in": theme.CATEGORICAL[0],
+    "Online": theme.CATEGORICAL[1],
+    "Activation": theme.CATEGORICAL[2],
+}
+
+# Attainment against pace, from the reserved status palette. Each band also
+# prints its percentage on the bar and names itself in the legend, so the
+# colour is never the only cue.
+PACE_BANDS = [
+    (1.00, "On or ahead of pace", theme.STATUS["good"]),
+    (0.90, "Slightly behind", theme.STATUS["warning"]),
+    (0.75, "Behind", theme.STATUS["serious"]),
+    (0.00, "Well behind", theme.STATUS["critical"]),
+]
+NO_TARGET = ("No target", theme.OTHER)
+
+
+def _band(achieved: float, target: float, expected: float) -> tuple[str, str]:
+    if not target:
+        return NO_TARGET
+    pace = (achieved / 100) / expected if expected else 0
+    for floor, label, color in PACE_BANDS:
+        if pace >= floor:
+            return label, color
+    return PACE_BANDS[-1][1:]
+
+
+def _attainment_chart(branches, expected: float, basis_label: str) -> go.Figure:
+    """Revenue bar per branch against a target tick, coloured by pace."""
+    rows = branches.fillna({"Target": 0, "% Achieved": 0})
+    bands = [_band(a, t, expected) for a, t in zip(rows["% Achieved"], rows["Target"])]
+    labels = [b[0] for b in bands]
+    custom = [
+        [t, a, expected * 100, t * expected - r, label]
+        for r, t, a, label in zip(rows["Revenue"], rows["Target"], rows["% Achieved"], labels)
+    ]
+    hover = (
+        "<b>%{y}</b><br>"
+        "Revenue&nbsp;&nbsp;&nbsp;<b>KES %{x:,.0f}</b><br>"
+        "Target&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;KES %{customdata[0]:,.0f}<br>"
+        "Achieved&nbsp;&nbsp;<b>%{customdata[1]:.1f}%</b>"
+        "&nbsp;(%{customdata[2]:.0f}% expected by now)<br>"
+        "%{customdata[4]}"
+        "<extra></extra>"
+    )
+
+    fig = go.Figure()
+    fig.add_bar(
+        y=rows["Branch"], x=rows["Revenue"], orientation="h", showlegend=False,
+        marker=dict(color=[b[1] for b in bands], cornerradius=4),
+        text=[f"{a:.0f}%" if t else "—" for a, t in zip(rows["% Achieved"], rows["Target"])],
+        textposition="outside", cliponaxis=False,
+        textfont=dict(color=theme.TEXT_SECONDARY, size=12),
+        customdata=custom, hovertemplate=hover,
+    )
+    has_target = rows[rows["Target"] > 0]
+    fig.add_scatter(
+        y=has_target["Branch"], x=has_target["Target"], mode="markers", name="Target",
+        marker=dict(symbol="line-ns", size=18, line=dict(width=2, color=theme.TEXT_PRIMARY)),
+        hoverinfo="skip",
+    )
+    # Legend entries for the colour bands actually on the chart.
+    present = set(labels)
+    for _, label, color in PACE_BANDS + [(None, *NO_TARGET)]:
+        if label in present:
+            fig.add_bar(x=[None], y=[None], orientation="h", name=label,
+                        marker=dict(color=color), hoverinfo="skip")
+
+    theme.apply_layout(fig, show_legend=True)
+    title = f"Revenue vs Target by Branch · {basis_label}"
+    if expected < 1:
+        title += f" · {expected:.0%} of the period gone"
+    fig.update_layout(
+        title=title, barmode="overlay", hovermode="closest",
+        height=max(420, 30 * len(rows) + 90),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=theme.GRIDLINE, tickformat="~s")
+    fig.update_yaxes(showgrid=False)
+    return fig
+
+
+@st.fragment()
+def render_sales(start_date: date, end_date: date) -> None:
+    with col_refresh:
+        db.refresh_button(key="sales_refresh")
+
+    df = db.run_query(
+        queries.SALES_PERFORMANCE_BY_BRANCH,
+        {"start_date": start_date, "end_date": end_date},
+    )
+
+    branches = df.loc[df["Branch"] != "GRAND TOTAL"].copy()
+    if df.empty or branches.empty:
+        st.info("No sales recorded for this date range yet.")
+        return
+
+    # The target follows the period picked: Month to Date and whole months use
+    # the monthly target, a week (Last 7 Days, a custom week) the weekly one, a
+    # single day the daily one — see lib.targets. The query's own choice went
+    # by the range's length alone and judged Month to Date against a week.
+    basis = targets.basis_for(
+        start_date, end_date,
+        db.run_query(queries.SALES_TARGET_ROWS, {"start_date": start_date, "end_date": end_date}))
+    # Corporate sales have a target of their own and are counted as Odoo's
+    # Sales & POS Dashboard counts them: revenue is the payments received on
+    # corporate invoices in the period, orders the number of those payments,
+    # quantity everything on the corporate jobs dated in it. Till sales to
+    # customers recorded as Corporate ("Shop Corporate") are the shops' own,
+    # in their revenue and targets. The grand total adds the corporate row,
+    # as Odoo's does.
+    params = {"start_date": start_date, "end_date": end_date}
+    corp_totals = db.run_query(queries.CORPORATE_TOTALS, params).iloc[0]
+    shop_corp = db.run_query(queries.CORPORATE_LINES, params)
+    shop_corp = shop_corp.loc[shop_corp["Channel"] == "Shop Corporate", "Revenue"].sum()
+    corp_row = {c: 0 for c in df.columns if c != "Branch"}
+    corp_row.update({"Branch": "Corporate", "Revenue": round(float(corp_totals["Revenue"]), 2),
+                     "Orders": int(corp_totals["Payments"]), "Qty": float(corp_totals["Qty"])})
+    total_at = df.index[df["Branch"] == "GRAND TOTAL"]
+    for col in ("Revenue", "Orders", "Qty"):
+        df.loc[total_at, col] = df.loc[total_at, col] + corp_row[col]
+    df = pd.concat([df[df["Branch"] != "GRAND TOTAL"], pd.DataFrame([corp_row]),
+                    df[df["Branch"] == "GRAND TOTAL"]], ignore_index=True)
+
+    is_total = df["Branch"] == "GRAND TOTAL"
+    df.loc[~is_total, "Target"] = df.loc[~is_total, "Branch"].map(basis.targets).fillna(0)
+    # The total is every row's target added up, corporate included, so it
+    # matches the rows above it.
+    df.loc[is_total, "Target"] = df.loc[~is_total, "Target"].sum()
+    df["% Achieved"] = (df["Revenue"] / df["Target"].where(df["Target"] > 0) * 100).round(2)
+    branches = df.loc[~is_total].copy()
+
+    totals = df.loc[is_total].iloc[0].fillna(0)
+    pct = totals["% Achieved"]
+    pace = basis.expected * 100
+
+    corporate = df.loc[df["Branch"] == "Corporate"].iloc[0]
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1.container(border=True):
+        st.metric("Revenue", f"KES {totals['Revenue']:,.0f}")
+    with k2.container(border=True):
+        st.metric("Orders", f"{totals['Orders']:,.0f}")
+    with k3.container(border=True):
+        st.metric("Units Sold", f"{totals['Qty']:,.0f}")
+    with k4.container(border=True):
+        st.metric("Target Achieved", f"{pct:,.1f}%",
+                  delta=f"{pct - pace:+,.1f} pts vs {pace:.0f}% expected by now",
+                  help=f"Revenue against the {basis.label}: KES {totals['Target']:,.0f}. "
+                       f"{pace:.0f}% of the period has passed, so that is the pace to match.")
+    with k5.container(border=True):
+        corp_pct = corporate["% Achieved"]
+        st.metric("Corporate Revenue", f"KES {corporate['Revenue']:,.0f}",
+                  delta=(f"{corp_pct:,.1f}% of target · {corp_pct - pace:+,.1f} pts vs pace"
+                         if pd.notna(corp_pct) else "no corporate target"),
+                  help=f"Payments received on corporate invoices in the period, as Odoo's Sales "
+                       f"& POS Dashboard counts them, against the corporate target of KES "
+                       f"{corporate['Target']:,.0f}. Till sales to Corporate customers (KES "
+                       f"{shop_corp:,.0f}) are in their shops' revenue and targets instead.")
+
+    st.caption(f"Last updated {datetime.now().strftime('%H:%M:%S')} · measured against the "
+               f"{basis.label} (KES {totals['Target']:,.0f}, the corporate target included) · "
+               "the Corporate row is payments received on corporate invoices, as Odoo's Sales & "
+               "POS Dashboard shows it; till sales to Corporate customers are in their shop's row")
+
+    if branches.empty:
+        with st.container(border=True):
+            grid.filterable_table(df, currency_columns=("Revenue", "Target"))
+        return
+
+    branches = branches.sort_values("Revenue", ascending=True)
+    # The shop-only charts leave the Corporate row out: its till sales are
+    # already in the shops' bars.
+    shops_only = branches[branches["Branch"] != "Corporate"]
+    with st.container(border=True):
+        theme.show(_attainment_chart(branches, basis.expected, basis.label))
+
+    col_share, col_channel = st.columns(2)
+    with col_share:
+        with st.container(border=True):
+            charts.share_chart(
+                charts.fold_other(shops_only["Branch"], shops_only["Revenue"]),
+                title="Revenue Share by Branch", key="sales_share_kind",
+            )
+    with col_channel:
+        with st.container(border=True):
+            channels = charts.fold_other(
+                list(CHANNEL_COLORS),
+                [totals[f"{c} Orders"] for c in CHANNEL_COLORS],
+            )
+            charts.share_chart(
+                channels, title="Orders by Channel", key="sales_channel_kind",
+                unit="orders", default="Pie",
+                colors=[CHANNEL_COLORS[c] for c in channels["Label"]],
+            )
+
+    with st.container(border=True):
+        mix = go.Figure()
+        by_orders = shops_only.sort_values("Orders", ascending=False)
+        for channel, color in CHANNEL_COLORS.items():
+            mix.add_bar(
+                x=by_orders["Branch"], y=by_orders[f"{channel} Orders"], name=channel,
+                marker=dict(color=color, line=dict(color=theme.CHART_SURFACE, width=1)),
+                customdata=by_orders[["Orders"]],
+                hovertemplate=(f"{channel}: <b>%{{y:,.0f}}</b> of %{{customdata[0]:,.0f}} orders"
+                               "<extra></extra>"),
+            )
+        theme.apply_layout(mix, show_legend=True)
+        mix.update_layout(barmode="stack", bargap=0.25, title="Order Mix by Branch", height=420)
+        mix.update_xaxes(tickangle=-40)
+        theme.show(mix)
+
+    with st.container(border=True):
+        grid.filterable_table(df, currency_columns=("Revenue", "Target"))
+
+
+render_sales(start_date, end_date)
