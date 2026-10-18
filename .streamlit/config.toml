@@ -8,7 +8,9 @@ font = "sans serif"
 
 [server]
 runOnSave = true
-port = 8502
+# No port here: Streamlit Community Cloud health-checks 8501 and fails to
+# start the app on any other. Locally, pass the port on the command line
+# (see app.py).
 
 [browser]
 gatherUsageStats = false

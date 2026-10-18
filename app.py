@@ -2,10 +2,12 @@
 
 Five pages: Sales, Shop Attendants, Shop Performance, WhatsApp & Social DMs,
 live from Postgres (Shop Attendants also reads feedback and training scores
-from Google Sheets), and Footfall Conversion, which reads footfall and revenue
-from the Reporting Google Sheet. Open access: there is no login page.
+from Google Sheets), and Footfall Conversion (walk-ins and orders live from
+Odoo, revenue balanced against the finance-reconciled Reporting sheet).
+Open access: there is no login page.
 
-Run locally:   streamlit run app.py   (port 8502, set in .streamlit/config.toml)
+Run locally:   streamlit run app.py --server.port 8502
+Hosted:        Streamlit Community Cloud, from the main branch (port 8501, its default)
 """
 from __future__ import annotations
 
