@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from lib import db, feedback, filters, grid, queries, scorecards, targets, theme, training
+from lib import db, feedback, filters, grid, queries, report, scorecards, targets, theme, training
 
 st.set_page_config(page_title="Shop Attendants · Denri Sales Operations Dashboard",
                    page_icon="🧑‍💼", layout="wide")
@@ -99,9 +99,12 @@ def render_attendants(start_date: date, end_date: date) -> None:
                                    key="attendants_section", label_visibility="collapsed")
     section = section if section in sections else sections[0]
 
+    per, basis = _individual_targets(df, shown, start_date, end_date)
+    _export_report(df, shown, per, basis, start_date, end_date, location, person)
+
     if section == "Sessions":
         if person == ALL_PEOPLE:
-            _by_person_chart(shown)
+            _by_person_chart(per, basis)
         with st.container(border=True):
             st.caption(f"{len(shown):,} rows · click a column header's filter icon to search or "
                        "narrow it. The last row is the total for the range.")
@@ -115,24 +118,23 @@ def render_attendants(start_date: date, end_date: date) -> None:
 
         st.subheader("By Shop Attendant / BA")
         with st.container(border=True):
-            st.caption("Each attendant's and BA's sales for the whole range, highest first, "
-                       "with the total at the bottom.")
-            per = (shown.groupby("Served By", as_index=False)
-                   .agg(Locations=("Location", lambda v: ", ".join(sorted(set(v)))),
-                        Sessions=("Session", "nunique"), Orders=("Orders", "sum"),
-                        **{"Sales Made": ("Sales Made", "sum")})
-                   .rename(columns={"Served By": "Shop Attendant / BA"})
-                   .sort_values("Sales Made", ascending=False))
-            per["Share %"] = (per["Sales Made"] / per["Sales Made"].sum() * 100).round(1)
-            per["Avg Sale"] = (per["Sales Made"] / per["Orders"].where(per["Orders"] > 0)).round(0)
-            per["Sales Made"] = per["Sales Made"].round(2)
-            total = {"Shop Attendant / BA": "TOTAL",
+            st.caption("Each attendant's and BA's sales against their individual target (their "
+                       "shop's target shared equally between everyone present there in the "
+                       "period), ranked by achievement, with the total at the bottom. Sales "
+                       "nobody was recorded on are left out.")
+            table = _ranking_table(per)
+            sales, target = table["Sales Made"].sum(), table["Individual Target"].sum()
+            targeted = per["Targeted"].sum()
+            total = {"Rank": None, "Shop Attendant / BA": "TOTAL",
                      "Locations": f"{shown['Location'].nunique()} locations",
-                     "Sessions": shown["Session"].nunique(), "Orders": int(per["Orders"].sum()),
-                     "Sales Made": round(per["Sales Made"].sum(), 2), "Share %": 100.0,
-                     "Avg Sale": round(per["Sales Made"].sum() / max(per["Orders"].sum(), 1), 0)}
-            grid.filterable_table(pd.concat([per, pd.DataFrame([total])], ignore_index=True),
-                                  currency_columns=("Sales Made", "Avg Sale"),
+                     "Team Size": "", "Sessions": int(table["Sessions"].sum()),
+                     "Orders": int(table["Orders"].sum()), "Sales Made": round(sales, 2),
+                     "Individual Target": round(target, 0),
+                     "Achievement %": round(targeted / target * 100, 1) if target else None,
+                     "Share %": 100.0,
+                     "Avg Sale": round(sales / max(table["Orders"].sum(), 1), 0)}
+            grid.filterable_table(pd.concat([table, pd.DataFrame([total])], ignore_index=True),
+                                  currency_columns=("Sales Made", "Individual Target", "Avg Sale"),
                                   pinned_columns=("Shop Attendant / BA",), height=440)
     elif section == "Sales Training":
         _training(start_date, end_date, location)
@@ -144,30 +146,193 @@ def render_attendants(start_date: date, end_date: date) -> None:
         _feedback_table(start_date, end_date, location, person)
 
 
-def _by_person_chart(shown: pd.DataFrame) -> None:
-    by_person = (shown[shown["Served By"] != NOT_RECORDED]
-                 .groupby("Served By", as_index=False)
-                 .agg(Sales=("Sales Made", "sum"), Orders=("Orders", "sum"),
-                      Sessions=("Session", "nunique"))
-                 .sort_values("Sales", ascending=True))
-    if by_person.empty:
+def _individual_targets(df: pd.DataFrame, shown: pd.DataFrame,
+                        start_date: date, end_date: date) -> tuple[pd.DataFrame, targets.Basis]:
+    """Each attendant's / BA's sales against their own target.
+
+    A person's target is their shop's target for the period shared equally
+    between everyone present at that shop in it — the attendants and BAs
+    recorded on its orders (Odoo's attendance check-in is not in use yet).
+    Team sizes come from the whole range at every shop (df), so picking a
+    location or person never changes anyone's target. Someone who worked at
+    two shops carries a share of both, and only their sales at shops with a
+    target count towards Achievement.
+    """
+    rows = db.run_query(queries.SALES_TARGET_ROWS, {"start_date": start_date, "end_date": end_date})
+    basis = targets.basis_for(start_date, end_date, rows)
+    team = df[df["Served By"] != NOT_RECORDED].groupby("Location")["Served By"].nunique()
+    pair = (shown[shown["Served By"] != NOT_RECORDED]
+            .groupby(["Served By", "Location"], as_index=False)
+            .agg(Sales=("Sales Made", "sum"), Orders=("Orders", "sum"),
+                 Sessions=("Session", "nunique")))
+    pair["Team Size"] = pair["Location"].map(team)
+    pair["Target"] = pair["Location"].map(pd.Series(basis.targets, dtype=float)) / pair["Team Size"]
+    pair["Targeted Sales"] = pair["Sales"].where(pair["Target"].notna(), 0.0)
+    per = pair.groupby("Served By", as_index=False).agg(
+        Locations=("Location", lambda v: ", ".join(sorted(set(v)))),
+        Team=("Team Size", lambda v: ", ".join(str(int(n)) for n in v)),
+        Sessions=("Sessions", "sum"), Orders=("Orders", "sum"), Sales=("Sales", "sum"),
+        Target=("Target", lambda v: v.sum(min_count=1)),
+        Targeted=("Targeted Sales", "sum"))
+    per["Achievement %"] = (per["Targeted"] / per["Target"].where(per["Target"] > 0) * 100).round(1)
+    per = per.sort_values(["Achievement %", "Sales"], ascending=[False, False], na_position="last")
+    return per.reset_index(drop=True), basis
+
+
+def _by_person_chart(per: pd.DataFrame, basis: targets.Basis) -> None:
+    ranked = per.dropna(subset=["Achievement %"]).sort_values("Achievement %")
+    if ranked.empty:
         return
-    top = by_person.tail(20)
+    due = basis.expected * 100
+
+    def status(pct: float) -> str:
+        if pct >= due:
+            return theme.STATUS["good"]
+        return theme.STATUS["warning"] if pct >= due * 0.8 else theme.STATUS["critical"]
+
     with st.container(border=True):
         fig = go.Figure()
         fig.add_bar(
-            y=top["Served By"], x=top["Sales"], orientation="h",
-            marker=dict(color=theme.sequential_colors(len(top)), cornerradius=4),
-            customdata=top[["Orders", "Sessions"]],
-            hovertemplate=("<b>%{y}</b><br>KES %{x:,.0f}<br>%{customdata[0]:,} orders"
-                           " · %{customdata[1]:,} sessions<extra></extra>"),
+            y=ranked["Served By"], x=ranked["Achievement %"], orientation="h",
+            marker=dict(color=[status(p) for p in ranked["Achievement %"]], cornerradius=4),
+            text=[f"{p:.0f}%" for p in ranked["Achievement %"]], textposition="outside",
+            textfont=dict(color=theme.TEXT_SECONDARY, size=11), cliponaxis=False,
+            customdata=ranked[["Sales", "Target", "Locations", "Team"]],
+            hovertemplate=("<b>%{y}</b> — %{customdata[2]}<br><b>%{x:.1f}%</b> of target"
+                           "<br>Sales KES %{customdata[0]:,.0f} of KES %{customdata[1]:,.0f}"
+                           "<br>Team of %{customdata[3]} sharing the shop target<extra></extra>"),
         )
+        fig.add_vline(x=due, line=dict(color=theme.TEXT_SECONDARY, width=1.5, dash="dot"),
+                      annotation_text="Target" if due >= 100 else f"Due by now ({due:.0f}%)",
+                      annotation_font_color=theme.TEXT_SECONDARY, annotation_position="top")
         theme.apply_layout(fig, show_legend=False)
-        fig.update_layout(title="Sales Made by Shop Attendant / BA", hovermode="closest",
-                          height=max(360, 28 * len(top) + 80))
-        fig.update_xaxes(showgrid=True, gridcolor=theme.GRIDLINE)
+        fig.update_layout(title="Shop Attendants / BAs Ranked by Achievement Against Individual Target",
+                          hovermode="closest", height=max(380, 26 * len(ranked) + 90))
+        top = max(ranked["Achievement %"].max(), due) * 1.12
+        fig.update_xaxes(showgrid=True, gridcolor=theme.GRIDLINE, ticksuffix="%", range=[0, top])
         fig.update_yaxes(showgrid=False)
         theme.show(fig)
+        missing = per[per["Achievement %"].isna()]["Served By"].tolist()
+        st.caption(
+            f"Individual target = the shop's {basis.label} shared equally between the attendants "
+            "and BAs present at that shop in the period (recorded on its orders). Green is at or "
+            f"above {'target' if due >= 100 else 'what is due by now'}, amber within 20% of it, "
+            "red further behind."
+            + (f" Not ranked (no shop target): {', '.join(missing)}." if missing else ""))
+
+
+def _ranking_table(per: pd.DataFrame) -> pd.DataFrame:
+    table = pd.DataFrame({
+        "Shop Attendant / BA": per["Served By"], "Locations": per["Locations"],
+        "Team Size": per["Team"], "Sessions": per["Sessions"], "Orders": per["Orders"].astype(int),
+        "Sales Made": per["Sales"].round(2), "Individual Target": per["Target"].round(0),
+        "Achievement %": per["Achievement %"],
+        "Share %": (per["Sales"] / per["Sales"].sum() * 100).round(1),
+        "Avg Sale": (per["Sales"] / per["Orders"].where(per["Orders"] > 0)).round(0),
+    })
+    table.insert(0, "Rank", [i + 1 if pd.notna(a) else None
+                             for i, a in enumerate(table["Achievement %"])])
+    return table
+
+
+SCORE_SHOP_COLUMNS = (["Location", "Score"] + scorecards.SCORE_COLUMNS
+                      + ["Revenue", "Target", "Target %", "Pace %", "Corporate Revenue",
+                         "Corporate Target", "Corporate %", "Orders",
+                         "Basket Value", "Basket Value %", "Bags", "Basket Size", "Attendants",
+                         "Revenue per Attendant", "Customers", "Repeat %", "Previous Customers",
+                         "Retained", "Retention %", "Feedback", "Feedback %", "Training %",
+                         "Chats", "Response Time (min)"])
+SCORE_PEOPLE_COLUMNS = (["Attendant / BA", "Location", "Score"] + scorecards.SCORE_COLUMNS
+                        + ["Team Size", "Target", "Revenue", "Target %", "Pace %", "Days Worked",
+                           "Revenue per Day", "Own Sales", "Orders", "Corporate Revenue",
+                           "Corporate Target", "Corporate %", "Basket Value", "Basket Value %",
+                           "Bags", "Basket Size", "Customers", "Repeat %", "Previous Customers",
+                           "Retained", "Retention %", "Feedback", "Feedback %", "Training %"])
+
+
+def _export_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
+                   basis: targets.Basis, start_date: date, end_date: date,
+                   location: str, person: str) -> None:
+    """Prepare the page's stats as an Excel workbook and a Word document.
+
+    Built only when asked for (the score cards read the feedback and training
+    sheets, which is slow) and kept for the current selection, so the two
+    download buttons don't rebuild it."""
+    key = (start_date, end_date, location, person)
+    with st.expander("📄 Export report — Excel (.xlsx) and Word (.docx)"):
+        st.caption("Summary, ranking against individual targets, shop and attendant score "
+                   "cards, and every session (Excel only) for the period and filters chosen above.")
+        if st.button("Prepare report", key="attendants_report_prepare", type="primary"):
+            with st.spinner("Preparing the report…"):
+                rep = _build_report(df, shown, per, basis, start_date, end_date, location, person)
+                st.session_state["attendants_report"] = (key, report.to_xlsx(rep), report.to_docx(rep))
+        saved = st.session_state.get("attendants_report")
+        if saved and saved[0] == key:
+            stem = f"Shop_Attendants_{start_date:%Y-%m-%d}" + (
+                "" if start_date == end_date else f"_to_{end_date:%Y-%m-%d}")
+            if location != "All Locations":
+                stem += f"_{location}"
+            if person != ALL_PEOPLE:
+                stem += "_" + "".join(ch if ch.isalnum() else "_" for ch in person).strip("_")
+            c1, c2 = st.columns(2)
+            c1.download_button("⬇️ Download Excel (.xlsx)", saved[1], file_name=f"{stem}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="attendants_report_xlsx", width="stretch")
+            c2.download_button("⬇️ Download Word (.docx)", saved[2], file_name=f"{stem}.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               key="attendants_report_docx", width="stretch")
+        elif saved:
+            st.caption("The filters changed since the last report — prepare it again.")
+
+
+def _build_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
+                  basis: targets.Basis, start_date: date, end_date: date,
+                  location: str, person: str) -> report.Report:
+    period = (f"{start_date:%A %d %B %Y}" if start_date == end_date
+              else f"{start_date:%d %b %Y} – {end_date:%d %b %Y}")
+    unrecorded = shown[shown["Served By"] == NOT_RECORDED]
+    ranking = _ranking_table(per)
+    on_target = ranking["Achievement %"].ge(basis.expected * 100).sum()
+    summary = [
+        ("Period", period), ("Location", location), ("Shop Attendant / BA", person),
+        ("Sales Made", f"KES {shown['Sales Made'].sum():,.0f}"),
+        ("POS Sessions", f"{shown['Session'].nunique():,} at {shown['Location'].nunique()} locations"),
+        ("Attendants & BAs", f"{len(set(shown['Served By']) - {NOT_RECORDED}):,}"),
+        ("Sales with nobody recorded", f"KES {unrecorded['Sales Made'].sum():,.0f} "
+                                       f"({int(unrecorded['Orders'].sum()):,} orders)"),
+        ("Target basis", f"{basis.label} · {basis.expected * 100:.0f}% due by now"),
+        ("At or above target", f"{on_target} of {ranking['Achievement %'].notna().sum()} ranked"),
+    ]
+    tables = [report.Table(
+        "Ranking vs Individual Target", ranking,
+        note="Individual target = the shop's target for the period shared equally between the "
+             "attendants and BAs present at that shop in it. Ranked by achievement.")]
+
+    data = _scorecard_data(start_date, end_date)
+    notes = []
+    if data is not None:
+        shops, people = data["shops"], data["people"]
+        if location != "All Locations":
+            shops = shops[shops["Location"] == location]
+            people = people[people["Location"] == location]
+        if person != ALL_PEOPLE:
+            people = people[people["Attendant / BA"] == person]
+        tables += [
+            report.Table("Shop Score Cards", shops[SCORE_SHOP_COLUMNS],
+                         note="Every measure scored out of 100; Score is their average.",
+                         doc_columns=["Location", "Score", "Revenue", "Target %", "Basket Value",
+                                      "Repeat %", "Retention %", "Feedback %", "Training %"]),
+            report.Table("Attendant Score Cards", people[SCORE_PEOPLE_COLUMNS],
+                         note="Revenue here is the shop's daily revenue shared between everyone "
+                              "who served that day; Own Sales is what the person rang up.",
+                         doc_columns=["Attendant / BA", "Location", "Score", "Revenue", "Target %",
+                                      "Own Sales", "Basket Value", "Feedback %", "Training %"]),
+        ]
+        notes = [n for n in (data["feedback_note"], data["training_note"]) if n]
+    tables.append(report.Table("Sessions", shown[COLUMNS].sort_values(["Date", "Location"]),
+                               in_doc=False))
+    title = "Shop Attendants Report"
+    return report.Report(title, f"{period} · {location} · {person}", summary, tables, notes)
 
 
 def _feedback_table(start_date: date, end_date: date, location: str, person: str) -> None:
@@ -593,12 +758,13 @@ def _training_scores(df: pd.DataFrame, start_date: date, end_date: date):
     return shop, person, note
 
 
-def _score_cards(start_date: date, end_date: date, location: str, person: str) -> None:
+def _scorecard_data(start_date: date, end_date: date) -> dict | None:
+    """Shop and attendant score cards for the range (None if nothing sold),
+    shared by the Score Cards section and the exported report."""
     orders = db.run_query(queries.SCORECARD_ORDERS,
                           {"start_date": start_date, "end_date": end_date})
     if orders.empty:
-        st.info("No sales in this date range.")
-        return
+        return None
     # The same number of days just before, for retention: 8-14 Oct is set
     # against 1-7 Oct, October 1-11 against 20-30 September.
     days = (end_date - start_date).days + 1
@@ -618,8 +784,23 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
     rows = db.run_query(queries.SALES_TARGET_ROWS,
                         {"start_date": start_date, "end_date": end_date})
     basis = targets.basis_for(start_date, end_date, rows)
-    basket = f"KES {scorecards.BASKET_TARGET:,}"
     shop_training, person_training, training_note = _training_scores(df, start_date, end_date)
+    shops = scorecards.shop_cards(df, previous, basis.targets, basis.expected,
+                                  shop_training, _response_times(start_date, end_date))
+    people = scorecards.attendant_cards(df, previous, basis.targets, basis.expected,
+                                        person_training)
+    return {"shops": shops, "people": people, "basis": basis, "prev_start": prev_start,
+            "prev_end": prev_end, "feedback_note": feedback_note, "training_note": training_note}
+
+
+def _score_cards(start_date: date, end_date: date, location: str, person: str) -> None:
+    data = _scorecard_data(start_date, end_date)
+    if data is None:
+        st.info("No sales in this date range.")
+        return
+    basis, prev_start, prev_end = data["basis"], data["prev_start"], data["prev_end"]
+    feedback_note, training_note = data["feedback_note"], data["training_note"]
+    basket = f"KES {scorecards.BASKET_TARGET:,}"
     due = f"{basis.expected * 100:.0f}% due by now"
 
     view = st.segmented_control("Score cards", ["🏪 Shop Score Cards", "🧑‍💼 Attendant Score Cards"],
@@ -653,8 +834,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         st.caption(training_note)
 
     if view == "🏪 Shop Score Cards":
-        shops = scorecards.shop_cards(df, previous, basis.targets, basis.expected,
-                                      shop_training, _response_times(start_date, end_date))
+        shops = data["shops"]
         shown = shops if location == "All Locations" else shops[shops["Location"] == location]
         _cumulative_chart(shown, "Location", "Cumulative Score Card — Shops")
         for _, r in shown.iterrows():
@@ -687,21 +867,13 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         with st.container(border=True):
             st.caption("All shops side by side, best cumulative score first, with each measure's "
                        "score and the total at the bottom.")
-            cols = (["Location", "Score"] + scorecards.SCORE_COLUMNS
-                    + ["Revenue", "Target", "Target %", "Pace %", "Corporate Revenue",
-                       "Corporate Target", "Corporate %", "Orders",
-                       "Basket Value", "Basket Value %", "Bags", "Basket Size", "Attendants",
-                       "Revenue per Attendant", "Customers", "Repeat %", "Previous Customers",
-                       "Retained", "Retention %", "Feedback", "Feedback %", "Training %",
-                       "Chats", "Response Time (min)"])
-            grid.filterable_table(shops[cols], pinned_columns=("Location",),
+            grid.filterable_table(shops[SCORE_SHOP_COLUMNS], pinned_columns=("Location",),
                                   currency_columns=("Revenue", "Target", "Corporate Revenue", "Corporate Target",
                                                     "Basket Value", "Revenue per Attendant"),
                                   height=460)
         return
 
-    people = scorecards.attendant_cards(df, previous, basis.targets, basis.expected,
-                                         person_training)
+    people = data["people"]
     if location != "All Locations":
         people = people[people["Location"] == location]
     st.caption(
@@ -748,13 +920,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         st.caption(f"The 12 best cumulative scores are shown as cards; all {len(people)} are in "
                    "the table. Pick a person at the top to see their card.")
     with st.container(border=True):
-        cols = (["Attendant / BA", "Location", "Score"] + scorecards.SCORE_COLUMNS
-                + ["Team Size", "Target", "Revenue", "Target %", "Pace %", "Days Worked", "Revenue per Day",
-                   "Own Sales", "Orders", "Corporate Revenue", "Corporate Target", "Corporate %",
-                   "Basket Value", "Basket Value %",
-                   "Bags", "Basket Size", "Customers", "Repeat %", "Previous Customers",
-                   "Retained", "Retention %", "Feedback", "Feedback %", "Training %"])
-        grid.filterable_table(people[cols], pinned_columns=("Attendant / BA",),
+        grid.filterable_table(people[SCORE_PEOPLE_COLUMNS], pinned_columns=("Attendant / BA",),
                               currency_columns=("Target", "Revenue", "Revenue per Day", "Corporate Target",
                                                 "Own Sales", "Corporate Revenue", "Basket Value"),
                               height=460)
