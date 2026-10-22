@@ -12,7 +12,6 @@ too, so an attendant at those shops is credited for their customers' feedback.
 """
 from __future__ import annotations
 
-import time
 
 import pandas as pd
 import streamlit as st
@@ -37,7 +36,6 @@ _TABS = {
                 "Phone": ["nambari ya simu"], "Branch": ["tawi"]},
 }
 _FIELDS = ["Submitted", "Name", "Phone", "Branch"]
-_RETRIES = 4
 
 
 class FeedbackUnavailable(Exception):
@@ -65,25 +63,14 @@ def _parse_timestamps(raw: pd.Series) -> pd.Series:
     return parsed
 
 
-def _with_retries(fetch):
-    """Google answers the odd read with a temporary 5xx; try again before giving up."""
-    for attempt in range(_RETRIES):
-        try:
-            return fetch()
-        except PermissionError:
-            raise
-        except Exception:
-            if attempt == _RETRIES - 1:
-                raise
-            time.sleep(3 * (attempt + 1))
 
-
-def _read_tab(sheet, title: str, words: dict[str, list[str]]) -> pd.DataFrame:
-    tabs = {ws.title.strip().lower(): ws for ws in sheet.worksheets()}
-    ws = tabs.get(title.lower())
-    if ws is None:
+def _read_tab(tabs: dict[str, list[list[str]]], title: str,
+              words: dict[str, list[str]]) -> pd.DataFrame:
+    found = {t.strip().lower(): t for t in tabs}
+    real = found.get(title.lower())
+    if real is None:
         return pd.DataFrame(columns=_FIELDS + ["Form"])
-    values = _with_retries(ws.get_all_values)
+    values = tabs[real]
     if len(values) < 2:
         return pd.DataFrame(columns=_FIELDS + ["Form"])
     header = [h.strip().lower() for h in values[0]]
@@ -93,21 +80,27 @@ def _read_tab(sheet, title: str, words: dict[str, list[str]]) -> pd.DataFrame:
         position = next((i for i, h in enumerate(header)
                          if any(w in h for w in words[field])), None)
         out[field] = rows[position].astype(str).str.strip() if position is not None else ""
-    out["Form"] = ws.title
+    out["Form"] = real
     return out
+
+
+def _not_shared(exc: Exception) -> bool:
+    text = str(exc).upper()
+    return isinstance(exc, PermissionError) or "403" in text or "PERMISSION" in text
 
 
 @st.cache_data(ttl=600, show_spinner="Reading customer feedback…")
 def load() -> pd.DataFrame:
     """Every feedback response: Submitted, Name, Phone, Branch, Form, Phone Key."""
     try:
-        sheet = _with_retries(lambda: sheets_sync._client().open_by_key(SPREADSHEET_ID))
-        frames = [_read_tab(sheet, title, words) for title, words in _TABS.items()]
-    except PermissionError as exc:
-        raise FeedbackUnavailable(
-            f"The feedback sheet is not shared with {service_account_email()}."
-        ) from exc
-    except Exception as exc:  # quota, a missing tab, Google being unavailable
+        # All four forms' tabs in one batched read.
+        _, tabs = sheets_sync.read_tabs(SPREADSHEET_ID, list(_TABS))
+        frames = [_read_tab(tabs, title, words) for title, words in _TABS.items()]
+    except Exception as exc:
+        if _not_shared(exc):
+            raise FeedbackUnavailable(
+                f"The feedback sheet is not shared with {service_account_email()}."
+            ) from exc
         raise FeedbackUnavailable(f"Could not read the feedback sheet: {exc}") from exc
 
     out = pd.concat(frames, ignore_index=True)

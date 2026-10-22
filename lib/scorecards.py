@@ -2,16 +2,22 @@
 
 Built from one row per order (queries.SCORECARD_ORDERS):
 
-  Revenue            — the shop's revenue. For an attendant it is the shop's
-                       revenue shared equally between everyone who served at
-                       that shop that day: a shop's sales are a team effort,
-                       and whoever keyed the order is not the only one who
-                       made the sale. Orders nobody was recorded on are
-                       shared too. Own Sales is what the person keyed.
+  Revenue            — against daily targets, day by day. A shop's target is
+                       the sum of its daily targets over the days so far in
+                       the period. An attendant's is, for each day they were
+                       on the floor (recorded on at least one order there),
+                       the shop's daily target shared equally between
+                       everyone on the floor that day — a 100,000 day with two
+                       attendants gives each 50,000 — summed over their days.
+                       Their Revenue is what they sold themselves (the orders
+                       recorded against them), so Target % is their own sales
+                       over their share. Orders nobody was recorded on count
+                       for the shop only.
   Corporate Revenue  — orders for customers recorded as Corporate, against a
                        corporate target of 10% of the revenue target (for an
-                       attendant, 10% of their equal share of it).
+                       attendant, 10% of their daily shares).
   Basket Value       — revenue per order; Basket Size — bags per order.
+  (Repeat Purchase and Retention are scored for shops only, not attendants.)
   Repeat Purchase    — share of the period's unique customers who bought on
                        two or more different days within the period (two
                        orders on the same day are one visit).
@@ -78,6 +84,10 @@ MEASURES = [
     ("Response Score", "Response vs Target %", "target"),
 ]
 SCORE_COLUMNS = [m[0] for m in MEASURES]
+# Repeat purchase and retention are judged at shop level only: whether a
+# customer comes back says more about the shop than about whoever served them.
+ATTENDANT_MEASURES = [m for m in MEASURES if m[0] not in ("Repeat Score", "Retention Score")]
+ATTENDANT_SCORE_COLUMNS = [m[0] for m in ATTENDANT_MEASURES]
 
 
 def placeholders(*frames: pd.DataFrame) -> set[str]:
@@ -137,12 +147,15 @@ def _customer_rates(df: pd.DataFrame, group: list[str]) -> pd.DataFrame:
     return out[["Customers", "Repeat %", "Feedback", "Feedback %"]]
 
 
-def _score(table: pd.DataFrame, expected: float) -> pd.DataFrame:
+def _day_key(dates: pd.Series) -> pd.Series:
+    return pd.to_datetime(dates).dt.date
+
+
+def _score(table: pd.DataFrame, expected: float = 1.0, measures=None) -> pd.DataFrame:
     """A score out of 100 for each measure, and the cumulative score.
 
-    Revenue is judged against the share of the target due by now: eleven
-    days into a 31-day month, 35% of the monthly target is on pace and
-    scores 100.
+    The revenue target is already only the days so far (daily targets), so
+    it is due in full: expected stays 1 and Pace % equals Target %.
     """
     out = table.copy()
     out["Pace %"] = (out["Target %"] / expected).round(1) if expected else np.nan
@@ -151,20 +164,22 @@ def _score(table: pd.DataFrame, expected: float) -> pd.DataFrame:
     out["Corporate Pace %"] = ((out["Corporate %"] / expected).round(1) if expected
                                else np.nan)
     out["Feedback of Target %"] = (out["Feedback %"] / FEEDBACK_TARGET * 100).round(1)
-    for column, measure, how in MEASURES:
+    measures = measures or MEASURES
+    for column, measure, how in measures:
         values = out[measure] if measure in out else pd.Series(np.nan, index=out.index)
         if how == "target":
             out[column] = values.clip(upper=100).round(0)
         else:
             out[column] = (values.rank(pct=True) * 100).round(0)
-    out["Score"] = out[SCORE_COLUMNS].mean(axis=1).round(0)
+    out["Score"] = out[[m[0] for m in measures]].mean(axis=1).round(0)
     return out
 
 
-def shop_cards(df: pd.DataFrame, previous: pd.DataFrame,
-               targets: dict[str, float], expected: float = 1.0,
+def shop_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataFrame,
                training: pd.Series | None = None,
                response: pd.DataFrame | None = None) -> pd.DataFrame:
+    """One row per shop. daily_targets is targets.daily(): Location, Date,
+    Target for each day so far in the period."""
     g = df.groupby("Location")
     staff = df[df["Served By"] != NOT_RECORDED]
     table = pd.DataFrame({
@@ -176,8 +191,9 @@ def shop_cards(df: pd.DataFrame, previous: pd.DataFrame,
         "Attendants": staff.groupby("Location")["Served By"].nunique(),
     })
     table["Attendants"] = table["Attendants"].fillna(0).astype(int)
-    table["Target"] = pd.Series(targets).reindex(table.index)
-    table["Target %"] = (table["Revenue"] / table["Target"] * 100).round(1)
+    shop_target = daily_targets.groupby("Location")["Target"].sum()
+    table["Target"] = shop_target.reindex(table.index)
+    table["Target %"] = (table["Revenue"] / table["Target"].where(table["Target"] > 0) * 100).round(1)
     table["Basket Value"] = (table["Revenue"] / table["Orders"]).round(0)
     table["Basket Value %"] = (table["Basket Value"] / BASKET_TARGET * 100).round(1)
     table["Basket Size"] = (table["Bags"] / table["Orders"]).round(2)
@@ -196,50 +212,48 @@ def shop_cards(df: pd.DataFrame, previous: pd.DataFrame,
     else:
         table["Response Time (min)"] = np.nan
         table["Chats"] = np.nan
-    table = _score(table, expected)
+    table = _score(table)
     table = table.reset_index().rename(columns={"index": "Location"})
     return table.sort_values("Score", ascending=False)
 
 
-def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame,
-                    targets: dict[str, float], expected: float = 1.0,
+def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataFrame,
                     training: pd.Series | None = None) -> pd.DataFrame:
     """One row per attendant or BA (per shop they served at).
 
-    Each person's revenue target is their shop's target for the period
-    shared equally between the attendants and BAs who served there in it.
+    Day by day: the shop's daily target is shared equally between everyone
+    on the floor that day, and a person's target is the sum of their shares
+    over the days they worked. Revenue is their own sales, so Target % is
+    what they generated over the target they were given.
     """
-    staffed = df[df["Served By"] != NOT_RECORDED]
-    team = staffed.groupby(["Location", "Date"])["Served By"].nunique().rename("Team")
-    day_rev = df.groupby(["Location", "Date"])["Revenue"].sum().rename("Day Revenue")
-    worked = (staffed[["Location", "Date", "Served By"]].drop_duplicates()
-              .join(team, on=["Location", "Date"]).join(day_rev, on=["Location", "Date"]))
-    worked["Share"] = worked["Day Revenue"] / worked["Team"]
+    staffed = df[df["Served By"] != NOT_RECORDED].assign(Day=lambda f: _day_key(f["Date"]))
+    team = staffed.groupby(["Location", "Day"])["Served By"].nunique().rename("Team")
+    day_target = (daily_targets.assign(Day=_day_key(daily_targets["Date"]))
+                  .groupby(["Location", "Day"])["Target"].sum().rename("Day Target"))
+    worked = (staffed[["Location", "Day", "Served By"]].drop_duplicates()
+              .join(team, on=["Location", "Day"]).join(day_target, on=["Location", "Day"]))
+    worked["Target Share"] = worked["Day Target"] / worked["Team"]
     keys = ["Served By", "Location"]
     g = staffed.groupby(keys)
+    by_person = worked.groupby(keys)
     table = pd.DataFrame({
-        "Revenue": worked.groupby(keys)["Share"].sum(),
-        "Days Worked": worked.groupby(keys)["Date"].nunique(),
-        "Own Sales": g["Revenue"].sum(),
+        "Revenue": g["Revenue"].sum().round(0),
+        "Days Worked": by_person["Day"].nunique(),
+        "Avg Team": by_person["Team"].mean().round(1),
+        "Target": by_person["Target Share"].sum(min_count=1).round(0),
         "Orders": g.size(),
         "Bags": g["Bags"].sum(),
         "Corporate Revenue": g.apply(lambda f: f.loc[f["Corporate"], "Revenue"].sum(),
                                      include_groups=False),
     })
-    table["Revenue"] = table["Revenue"].round(0)
-    team_size = staffed.groupby("Location")["Served By"].nunique()
-    shop = table.index.get_level_values("Location")
-    table["Team Size"] = team_size.reindex(shop).to_numpy()
-    table["Target"] = (pd.Series(targets).reindex(shop).to_numpy() / table["Team Size"]).round(0)
-    table["Target %"] = (table["Revenue"] / table["Target"] * 100).round(1)
+    table["Target %"] = (table["Revenue"] / table["Target"].where(table["Target"] > 0) * 100).round(1)
     table["Revenue per Day"] = (table["Revenue"] / table["Days Worked"]).round(0)
-    table["Basket Value"] = (table["Own Sales"] / table["Orders"]).round(0)
+    table["Basket Value"] = (table["Revenue"] / table["Orders"]).round(0)
     table["Basket Value %"] = (table["Basket Value"] / BASKET_TARGET * 100).round(1)
     table["Basket Size"] = (table["Bags"] / table["Orders"]).round(2)
-    table = table.join(_customer_rates(staffed, keys))
-    table = table.join(retention(df, previous[previous["Served By"] != NOT_RECORDED], keys))
+    table = table.join(_customer_rates(staffed, keys).drop(columns=["Repeat %"]))
     table["Training %"] = (training.reindex(table.index).round(1) if training is not None
                            else np.nan)
-    table = _score(table, expected)
+    table = _score(table, measures=ATTENDANT_MEASURES)
     table = table.reset_index().rename(columns={"Served By": "Attendant / BA"})
     return table.sort_values("Score", ascending=False)

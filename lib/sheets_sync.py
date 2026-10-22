@@ -17,6 +17,7 @@ changes past numbers.
 """
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timedelta
 
 import gspread
@@ -122,6 +123,58 @@ def _client() -> gspread.Client:
         )
     creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
     return gspread.authorize(creds)
+
+
+def _quoted(title: str) -> str:
+    """A tab title as an A1 range for the whole tab ('1st Oct' -> "'1st Oct'")."""
+    return "'" + title.replace("'", "''") + "'"
+
+
+def read_tabs(spreadsheet_id: str, titles: list[str] | None = None,
+              retries: int = 4) -> tuple[str, dict[str, list[list[str]]]]:
+    """(spreadsheet title, {tab title: rows}) for every tab — or just `titles`
+    — in two API calls: one for the tab list, one batched read of all the
+    values.
+
+    Reading tab by tab (open_by_key, then worksheets() and get_all_values()
+    per tab) costs a request per tab plus a metadata request for every
+    lookup, and the service account only gets 60 reads a minute: the
+    training sheet's tab-a-day layout alone went over it, and every 429
+    then waited out a retry — feedback took ~2 minutes, training failed.
+
+    Rows are padded to the widest row, as get_all_values() returns them, so
+    callers can index columns without checking each row's length. Tab
+    titles asked for that don't exist are left out of the result.
+    """
+    http = _client().http_client
+
+    def call(fetch):
+        for attempt in range(retries):
+            try:
+                return fetch()
+            except gspread.exceptions.APIError as exc:
+                code = getattr(exc, "code", None) or getattr(getattr(exc, "response", None),
+                                                             "status_code", None)
+                if code == 403 or attempt == retries - 1:
+                    raise
+                # 429 is a per-minute quota: back off long enough to matter.
+                time.sleep(15 * (attempt + 1) if code == 429 else 2 ** attempt)
+
+    meta = call(lambda: http.fetch_sheet_metadata(
+        spreadsheet_id, params={"fields": "properties.title,sheets.properties.title"}))
+    available = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if titles is not None:
+        wanted = {t.strip().lower() for t in titles}
+        available = [t for t in available if t.strip().lower() in wanted]
+    if not available:
+        return meta["properties"]["title"], {}
+    body = call(lambda: http.values_batch_get(spreadsheet_id, [_quoted(t) for t in available]))
+    tabs: dict[str, list[list[str]]] = {}
+    for title, part in zip(available, body.get("valueRanges", [])):
+        rows = [[str(c) for c in r] for r in part.get("values", [])]
+        width = max((len(r) for r in rows), default=0)
+        tabs[title] = [r + [""] * (width - len(r)) for r in rows]
+    return meta["properties"]["title"], tabs
 
 
 def _worksheet() -> gspread.Worksheet:

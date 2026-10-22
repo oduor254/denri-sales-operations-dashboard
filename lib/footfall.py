@@ -43,7 +43,7 @@ import pandas as pd
 import streamlit as st
 
 from lib import sheets_sync
-from lib.feedback import _with_retries, service_account_email
+from lib.feedback import _not_shared, service_account_email
 
 SPREADSHEET_ID = "1S4kRCl1KWMTWKaSF8NSIXjDiJmvREzv7hm4vDnowdqs"
 FOOTFALL_TAB = "Footfall"
@@ -153,16 +153,19 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
     """(footfall, revenue): footfall per Shop/Date, revenue per Shop/Date
     (shops and Other Channels alike)."""
     try:
-        sheet = _with_retries(lambda: sheets_sync._client().open_by_key(SPREADSHEET_ID))
-        foot = _with_retries(lambda: sheet.worksheet(FOOTFALL_TAB).get_all_values())
-        rev = _with_retries(lambda: sheet.worksheet(REVENUE_TAB).get_all_values())
-    except PermissionError as exc:
-        raise SheetUnavailable(
-            f"The Reporting sheet is not shared with {service_account_email()}."
-        ) from exc
-    except Exception as exc:  # quota, a renamed tab, Google being unavailable
+        # Both tabs in one batched read.
+        _, tabs = sheets_sync.read_tabs(SPREADSHEET_ID, [FOOTFALL_TAB, REVENUE_TAB])
+    except Exception as exc:  # not shared, quota, Google being unavailable
+        if _not_shared(exc):
+            raise SheetUnavailable(
+                f"The Reporting sheet is not shared with {service_account_email()}."
+            ) from exc
         raise SheetUnavailable(f"Could not read the Reporting sheet: {exc}") from exc
-    return _parse_footfall(foot), _parse_revenue(rev)
+    found = {t.strip().lower(): v for t, v in tabs.items()}
+    missing = [t for t in (FOOTFALL_TAB, REVENUE_TAB) if t.lower() not in found]
+    if missing:
+        raise SheetUnavailable(f"The Reporting sheet has no {' or '.join(missing)} tab.")
+    return _parse_footfall(found[FOOTFALL_TAB.lower()]), _parse_revenue(found[REVENUE_TAB.lower()])
 
 
 def daily_targets(rows: pd.DataFrame, start: date, end: date) -> pd.DataFrame:

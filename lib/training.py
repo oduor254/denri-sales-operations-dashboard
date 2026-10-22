@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import difflib
 import re
-import time
 from datetime import date
 
 import numpy as np
@@ -38,7 +37,6 @@ LOCATION_NAMES = {"ktda": "Ktda", "ktda shop": "Ktda", "dar-es-alam": "Sinza"}
 _TAB_DAY = re.compile(r"^\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)", re.IGNORECASE)
 _SCORE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*$")
 _META = {"timestamp", "email address", "score", "name", "location"}
-_RETRIES = 4
 
 
 class TrainingUnavailable(Exception):
@@ -49,15 +47,6 @@ def location(raw) -> str:
     text = str(raw or "").strip()
     return LOCATION_NAMES.get(text.lower(), text.title()) if text else "Not recorded"
 
-
-def _with_retries(fetch):
-    for attempt in range(_RETRIES):
-        try:
-            return fetch()
-        except Exception as exc:  # Google's 429/503s pass with a pause
-            if attempt == _RETRIES - 1 or "PERMISSION" in str(exc).upper():
-                raise
-            time.sleep(2 ** attempt)
 
 
 def _tab_date(title: str, year: int) -> date | None:
@@ -122,17 +111,16 @@ def _read_responses(title: str, values: list[list[str]], day: date) -> pd.DataFr
 def load() -> dict:
     """{"responses": one row per answer, "roster": the team list,
     "days": every questionnaire day, "skipped": copied tabs left out}."""
-    client = sheets_sync._client()
     frames, roster_rows, days, skipped = [], [], set(), []
     for sheet_id in SPREADSHEETS:
         try:
-            sheet = _with_retries(lambda: client.open_by_key(sheet_id))
-            tabs = {ws.title: _with_retries(ws.get_all_values) for ws in sheet.worksheets()}
+            # Every tab (one per questionnaire day) in one batched read.
+            sheet_title, tabs = sheets_sync.read_tabs(sheet_id)
         except Exception as exc:
             raise TrainingUnavailable(
                 f"Could not read the sales training sheet ({exc}). Share it with "
                 f"{feedback.service_account_email()} as a Viewer.") from exc
-        year_match = re.search(r"(20\d\d)", sheet.title)
+        year_match = re.search(r"(20\d\d)", sheet_title)
         year = int(year_match.group(1)) if year_match else date.today().year
         seen: dict[frozenset, str] = {}
         for title, values in tabs.items():

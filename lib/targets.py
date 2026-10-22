@@ -42,6 +42,27 @@ def _amount(rows: pd.DataFrame, kind: str, on: date) -> dict:
     return hit.groupby("Location")["Target"].sum().to_dict()
 
 
+def daily(rows: pd.DataFrame, start: date, end: date, today: date | None = None) -> pd.DataFrame:
+    """Each location's daily target on every day of [start, end] up to today
+    (Location, Date, Target) — the days still to come aren't due yet."""
+    cols = ["Location", "Date", "Target"]
+    today = today or date.today()
+    end = min(end, today)
+    if rows is None or rows.empty or end < start:
+        return pd.DataFrame(columns=cols)
+    day_rows = rows[rows["Kind"] == "day"].copy()
+    day_rows["Starts"] = pd.to_datetime(day_rows["Starts"]).dt.date
+    day_rows["Ends"] = pd.to_datetime(day_rows["Ends"]).dt.date
+    out = []
+    d = start
+    while d <= end:
+        hit = day_rows[(day_rows["Starts"] <= d) & (day_rows["Ends"] >= d)]
+        for loc, amount in hit.groupby("Location")["Target"].sum().items():
+            out.append({"Location": loc, "Date": d, "Target": float(amount)})
+        d += timedelta(days=1)
+    return pd.DataFrame(out, columns=cols)
+
+
 def basis_for(start: date, end: date, rows: pd.DataFrame, today: date | None = None) -> Basis:
     today = today or date.today()
     rows = rows.copy()
