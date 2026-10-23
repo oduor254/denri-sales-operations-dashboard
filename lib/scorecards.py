@@ -102,11 +102,28 @@ ATTENDANT_MEASURES = [
     ("Training Score", "Training %", 5),
     ("Attendance Score", "Attendance %", 5),
 ]
+# The shop's own card: its business as a whole, every measure counting
+# equally (no weights agreed for it). Basket size, repeat purchase and
+# retention have no target, so they are ranked against the other shops:
+# 100 is the best shop.
+SHOP_MEASURES = [
+    ("Revenue Score", "Target %", 1),
+    ("Corporate Score", "Corporate %", 1),
+    ("Basket Value Score", "Basket Value %", 1),
+    ("Basket Size Score", "Basket Size Rank %", 1),
+    ("Repeat Score", "Repeat Rank %", 1),
+    ("Retention Score", "Retention Rank %", 1),
+    ("Feedback Score", "Feedback of Target %", 1),
+    ("Training Score", "Training %", 1),
+    ("Response Score", "Response vs Target %", 1),
+]
+SHOP_SCORE_COLUMNS = [m[0] for m in SHOP_MEASURES]
 HEAD_SCORE_COLUMNS = [m[0] for m in HEAD_MEASURES]
 ATTENDANT_SCORE_COLUMNS = [m[0] for m in ATTENDANT_MEASURES]
 WEIGHTS = {m[0]: m[2] for m in HEAD_MEASURES + ATTENDANT_MEASURES}
 # Kept for anything still asking for the one list of score columns.
-SCORE_COLUMNS = list(dict.fromkeys(HEAD_SCORE_COLUMNS + ATTENDANT_SCORE_COLUMNS))
+SCORE_COLUMNS = list(dict.fromkeys(SHOP_SCORE_COLUMNS + HEAD_SCORE_COLUMNS
+                                   + ATTENDANT_SCORE_COLUMNS))
 
 
 def placeholders(*frames: pd.DataFrame) -> set[str]:
@@ -195,11 +212,15 @@ def match_feedback(orders: pd.DataFrame, responses: pd.DataFrame | None) -> pd.D
     o["Ordered At"] = pd.to_datetime(o["Ordered At"])
     o["Shop"] = o["Location"].str.lower()
     window = pd.Timedelta(days=FEEDBACK_WINDOW_DAYS)
+    lead = pd.Timedelta(hours=FORM_LEAD_HOURS)
+    # Only forms sent near these orders can match: the sheet holds every form
+    # ever, and checking all ~22,000 one by one took two minutes.
+    forms = forms[(forms["Submitted"] >= o["Ordered At"].min() - lead)
+                  & (forms["Submitted"] <= o["Ordered At"].max() + window)]
 
     by_phone = forms.dropna(subset=["Phone Key"]).merge(
         o.dropna(subset=["Customer"]), left_on="Phone Key", right_on="Customer",
         suffixes=("", "_o"))
-    lead = pd.Timedelta(hours=FORM_LEAD_HOURS)
     gap = by_phone["Submitted"] - by_phone["Ordered At"]
     by_phone = by_phone[(gap <= window) & (gap >= -lead)]
     by_phone["Same Shop"] = by_phone["Shop"] == by_phone["Shop_o"]
@@ -214,9 +235,13 @@ def match_feedback(orders: pd.DataFrame, responses: pd.DataFrame | None) -> pd.D
         lambda n: {w for w in "".join(c if c.isalpha() else " " for c in str(n or "")).lower().split()
                    if len(w) >= 3})
     found = []
+    by_shop = {shop: g for shop, g in o.groupby("Shop")}
+    empty = o.iloc[0:0]
     for _, f in rest.sort_values("Submitted").iterrows():
-        near = o[(o["Shop"] == f["Shop"]) & (o["Ordered At"] <= f["Submitted"] + lead)
-                 & (f["Submitted"] - o["Ordered At"] <= window) & ~o["Order ID"].isin(taken)]
+        shop_orders = by_shop.get(f["Shop"], empty)
+        near = shop_orders[(shop_orders["Ordered At"] <= f["Submitted"] + lead)
+                           & (f["Submitted"] - shop_orders["Ordered At"] <= window)
+                           & ~shop_orders["Order ID"].isin(taken)]
         near = near.assign(Gap=(f["Submitted"] - near["Ordered At"]).abs())
         hit = None
         phone = f["Phone Key"]
@@ -449,9 +474,21 @@ def shop_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataF
 
     table["Head"] = (heads.set_index("Location")["Head"].reindex(table.index)
                      if heads is not None and not heads.empty else None)
+    # For the shop's own card (shop_overall).
+    table["Corporate Target"] = (table["Target"] * CORPORATE_SHARE).round(0)
+    table["Corporate %"] = _pct(table["Corporate Revenue"], table["Corporate Target"])
+    for value, rank in (("Basket Size", "Basket Size Rank %"), ("Repeat %", "Repeat Rank %"),
+                        ("Retention %", "Retention Rank %")):
+        table[rank] = (pd.to_numeric(table[value], errors="coerce").rank(pct=True) * 100).round(1)
     table = weighted(table, HEAD_MEASURES)
     table = table.reset_index().rename(columns={"index": "Location"})
     return table.sort_values("Score", ascending=False)
+
+
+def shop_overall(shops: pd.DataFrame) -> pd.DataFrame:
+    """The shops' own score cards from shop_cards()'s rows: the shop's
+    business as a whole on SHOP_MEASURES, each counting equally."""
+    return weighted(shops, SHOP_MEASURES).sort_values("Score", ascending=False)
 
 
 def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataFrame,
