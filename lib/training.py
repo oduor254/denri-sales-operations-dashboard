@@ -157,7 +157,23 @@ def load() -> dict:
         responses["Email"] = responses["Email"].map(
             lambda e: e if e in team.index
             else next(iter(difflib.get_close_matches(e, known, n=1, cutoff=0.9)), e))
-        responses = responses.drop_duplicates(["Day", "Email"], keep="first")
+        # An answer from an address not on the list at all is matched by the
+        # name and shop typed on the form — Gloria at Sinza answered from
+        # glorymunisi8@icloud.com from 13 Oct 2026, not the listed
+        # glorymunisi87@gmail.com. Both orders are tried, because the Name and
+        # Location boxes get swapped (her 14 and 15 Oct answers read name
+        # "Sinza", location "Gloria").
+        stray = ~responses["Email"].isin(team.index)
+        responses.loc[stray, "Email"] = [
+            match_person(name, shop, roster)
+            or match_person(shop_typed, location(name_typed), roster)
+            or email
+            for email, name, shop, name_typed, shop_typed in zip(
+                responses.loc[stray, "Email"], responses.loc[stray, "Typed Name"],
+                responses.loc[stray, "Typed Location"], responses.loc[stray, "Typed Name"],
+                responses.loc[stray, "Typed Location"])]
+        responses = (responses.sort_values("Submitted")
+                     .drop_duplicates(["Day", "Email"], keep="first"))
         responses["On List"] = responses["Email"].isin(team.index)
         responses["Name"] = responses["Email"].map(team["Name"]).fillna(
             responses["Typed Name"].str.title())
