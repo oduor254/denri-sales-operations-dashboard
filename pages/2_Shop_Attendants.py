@@ -240,6 +240,7 @@ SCORE_SHOP_COLUMNS = (["Location", "Head", "Score", "Weight Covered %"] + scorec
                          "Walk-ins", "Walk-in Orders", "Walk-in Conversion %",
                          "WhatsApp Chats", "WhatsApp Converted", "WhatsApp Conversion %",
                          "Chats", "Response Time (min)", "Customers", "Feedback", "Feedback %",
+                         "Forms Received", "Forms Matched",
                          "Training Completion %", "Training %", "Stock Variance %",
                          "Last Stock Count", "Attendants", "Revenue per Attendant", "Bags",
                          "Basket Size", "Repeat %", "Retention %", "Corporate Revenue"])
@@ -344,7 +345,7 @@ def _build_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
 
 
 def _feedback_table(start_date: date, end_date: date, location: str, person: str) -> None:
-    """How many of each person's converted customers then left feedback."""
+    """How many of each person's customers left feedback about their purchase."""
     st.subheader("Customer Feedback by Shop Attendant / BA")
     try:
         responses = feedback.load()
@@ -358,58 +359,70 @@ def _feedback_table(start_date: date, end_date: date, location: str, person: str
         )
         return
 
-    customers = db.run_query(queries.SHOP_ATTENDANT_CUSTOMERS,
-                             {"start_date": start_date, "end_date": end_date})
+    orders = db.run_query(queries.SCORECARD_ORDERS,
+                          {"start_date": start_date, "end_date": end_date})
+    if orders.empty:
+        st.info("No sales in this range.")
+        return
+    not_customers = scorecards.placeholders(orders)
+    df = scorecards.apply_feedback(scorecards.prepare(orders, not_customers),
+                                   _match_forms(orders, not_customers, end_date, responses))
     if location != "All Locations":
-        customers = customers[customers["Location"] == location]
+        df = df[df["Location"] == location]
     if person != ALL_PEOPLE:
-        customers = customers[customers["Served By"] == person]
-    customers = customers[customers["Served By"] != NOT_RECORDED]
-    if customers.empty:
-        st.info("No converted customers in this range.")
+        df = df[df["Served By"] == person]
+    df = df[df["Served By"] != NOT_RECORDED]
+    if df.empty:
+        st.info("No sales with an attendant or BA recorded in this range.")
         return
 
-    # Feedback counts if it came in during the range, on or after the day the
-    # customer bought — feedback given before the purchase is about an earlier
-    # visit, not this attendant's sale.
-    window = responses[(responses["Submitted"].dt.date >= start_date)
-                       & (responses["Submitted"].dt.date <= end_date)
-                       & responses["Phone Key"].notna()]
-    first_feedback = window.groupby("Phone Key")["Submitted"].min()
-
-    # One customer per person, however many shops or orders they bought across.
-    per_customer = (customers.assign(Key=customers["Phone Key"].fillna(
-                        "name:" + customers["Customer"]))
-                    .groupby(["Served By", "Key"], as_index=False)
-                    .agg(Customer=("Customer", "first"), Phone=("Phone", "first"),
+    # One customer per person, however many shops or orders they bought
+    # across; an order with no usable phone (the shop's own number typed in)
+    # is a customer of its own, so a form matched to it by name still counts.
+    df = df.assign(Key=df["Customer"].where(df["Customer"].notna(),
+                                            "order:" + df["Order ID"].astype(str)))
+    per_customer = (df.groupby(["Served By", "Key"], as_index=False)
+                    .agg(Customer=("Customer Name", "first"), Phone=("Customer", "first"),
                          Locations=("Location", lambda v: ", ".join(sorted(set(v)))),
-                         Bought=("First Purchase", "min"), Orders=("Orders", "sum")))
-    fed = per_customer["Key"].map(first_feedback)
-    per_customer["Feedback On"] = fed.dt.date
-    per_customer["Gave Feedback"] = fed.notna() & (fed.dt.date >= pd.to_datetime(per_customer["Bought"]).dt.date)
+                         Bought=("Day", "min"), Orders=("Order ID", "size"),
+                         **{"Gave Feedback": ("Feedback", "max"),
+                            "Feedback On": ("Feedback On", "min"),
+                            "Matched By": ("Feedback Match", "first")}))
+    per_customer["Gave Feedback"] = per_customer["Gave Feedback"].fillna(False).astype(bool)
+    per_customer["Feedback On"] = pd.to_datetime(per_customer["Feedback On"]).dt.date
 
     table = (per_customer.groupby("Served By")
              .agg(Location=("Locations", lambda v: ", ".join(sorted({x for s in v for x in s.split(", ")}))),
-                  **{"Customers Converted": ("Key", "size"),
-                     "Gave Feedback": ("Gave Feedback", "sum")})
+                  **{"Customers Served": ("Key", "size"),
+                     "Gave Feedback": ("Gave Feedback", "sum"),
+                     "By Phone": ("Matched By", lambda v: int((v == "Phone").sum())),
+                     "By Near-miss Phone / Name": ("Matched By", lambda v: int(v.isin(["Near-miss phone", "Name"]).sum()))})
              .reset_index().rename(columns={"Served By": "Shop Attendant / BA"}))
-    table["Feedback Rate"] = (table["Gave Feedback"] / table["Customers Converted"] * 100).round(1)
-    table = table.sort_values(["Feedback Rate", "Customers Converted"], ascending=[False, False])
+    table["Feedback Rate"] = (table["Gave Feedback"] / table["Customers Served"] * 100).round(1)
+    table = table.sort_values(["Feedback Rate", "Customers Served"], ascending=[False, False])
 
-    converted, gave = int(table["Customers Converted"].sum()), int(table["Gave Feedback"].sum())
+    day = responses["Submitted"].dt.date
+    window = responses[(day >= start_date) & (day <= end_date)]
+    if location != "All Locations":
+        window = window[window["Branch"].astype(str).str.strip().str.lower() == location.lower()]
+    served, gave = int(table["Customers Served"].sum()), int(table["Gave Feedback"].sum())
     items = [
-        ("Customers Converted", f"{converted:,}", None),
-        ("Gave Feedback", f"{gave:,}", f"{gave / converted * 100:.1f}% of converted" if converted else None),
-        ("Feedback Received", f"{len(window):,}", "all responses in this range"),
+        ("Customers Served", f"{served:,}", None),
+        ("Gave Feedback", f"{gave:,}", f"{gave / served * 100:.1f}% of customers served" if served else None),
+        ("Forms Received", f"{len(window):,}",
+         "naming this shop in this range" if location != "All Locations" else "all forms in this range"),
     ]
     for col, (label, value, note) in zip(st.columns(len(items)), items):
         with col.container(border=True):
             st.metric(label, value, note, delta_color="off")
     st.caption(
-        "A converted customer counts as giving feedback when a response with their phone "
-        "number (matched on the last nine digits) came in during this range, on or after the "
-        "day they bought. Each customer counts once per attendant or BA, however many orders "
-        "they placed."
+        "A customer counts as giving feedback when a form is matched to their purchase in this "
+        "range: by the phone number (last nine digits) — the form can come in any time up to "
+        f"{scorecards.FEEDBACK_WINDOW_DAYS} days after, even after the range — or, when the "
+        "number on the form isn't the one on the POS, by the first name on the form against "
+        f"the shop's customers in the {scorecards.NAME_MATCH_DAYS} days before, or a number "
+        "one or two digits off theirs (a typo). Each customer counts once per attendant or BA. Forms Received can still be higher: forms "
+        "about purchases before the range, and forms that couldn't be matched at all."
     )
     with st.container(border=True):
         grid.filterable_table(table, pinned_columns=("Shop Attendant / BA",), height=420)
@@ -420,7 +433,8 @@ def _feedback_table(start_date: date, end_date: date, location: str, person: str
         # the expander is opened.
         st.markdown(f"**{person}'s customers and their feedback**")
         detail = per_customer[["Customer", "Phone", "Locations", "Bought", "Orders",
-                               "Gave Feedback", "Feedback On"]].copy()
+                               "Gave Feedback", "Feedback On", "Matched By"]].copy()
+        detail["Phone"] = detail["Phone"].where(~detail["Phone"].astype(str).str.startswith("partner:"))
         detail["Gave Feedback"] = detail["Gave Feedback"].map({True: "Yes", False: "No"})
         with st.container(border=True):
             grid.filterable_table(detail.sort_values(["Gave Feedback", "Bought"],
@@ -844,6 +858,23 @@ def _training_scores(df: pd.DataFrame, start_date: date, end_date: date):
     return shop, person, completion, note
 
 
+def _match_forms(orders: pd.DataFrame, not_customers: set[str], end_date: date,
+                 responses: pd.DataFrame | None) -> pd.DataFrame:
+    """Feedback forms matched to sales (scorecards.match_feedback).
+
+    Forms are matched against every order from the start of the range to
+    today, not just the range: a form sent after the period still counts for
+    its purchase, and one about a later purchase isn't credited to an
+    earlier one."""
+    if responses is None or responses.empty:
+        return pd.DataFrame(columns=["Form", "Order ID", "Submitted", "Staff Rating", "How"])
+    later = (db.run_query(queries.SCORECARD_ORDERS,
+                          {"start_date": end_date + timedelta(days=1), "end_date": date.today()})
+             if end_date < date.today() else orders.iloc[0:0])
+    pool = scorecards.prepare(pd.concat([orders, later], ignore_index=True), not_customers)
+    return scorecards.match_feedback(pool, responses)
+
+
 def _optional(sql: str, params: dict | None = None) -> pd.DataFrame | None:
     """A query for one score-card measure: if it fails, the measure is left
     out rather than the whole section."""
@@ -875,8 +906,8 @@ def _scorecard_data(start_date: date, end_date: date) -> dict | None:
         feedback_note = None
     except feedback.FeedbackUnavailable as exc:
         responses, feedback_note = None, str(exc)
-    df["Feedback"] = scorecards.gave_feedback(df, responses)
-    df["Staff Rating"] = scorecards.staff_ratings(df, responses)
+    matches = _match_forms(orders, not_customers, end_date, responses)
+    df = scorecards.apply_feedback(df, matches if responses is not None else None)
     rows = db.run_query(queries.SALES_TARGET_ROWS, params)
     basis = targets.basis_for(start_date, end_date, rows)
     shop_training, person_training, completion, training_note = _training_scores(
@@ -892,7 +923,31 @@ def _scorecard_data(start_date: date, end_date: date) -> dict | None:
         df, previous, day_targets, person_training, walkins=walkins, wa=chats,
         attendance=_optional(queries.ATTENDANCE_DAYS, params))
     return {"shops": shops, "people": people, "basis": basis, "prev_start": prev_start,
-            "prev_end": prev_end, "feedback_note": feedback_note, "training_note": training_note}
+            "prev_end": prev_end, "feedback_note": feedback_note, "training_note": training_note,
+            "feedback_matching": _feedback_matching(shops, df, matches, responses,
+                                                    start_date, end_date)}
+
+
+def _feedback_matching(shops: pd.DataFrame, df: pd.DataFrame, matches: pd.DataFrame,
+                       responses: pd.DataFrame | None, start_date: date,
+                       end_date: date) -> pd.DataFrame | None:
+    """Per shop: forms that named it in the period, against the forms matched
+    to its orders in the period and how — adds the counts to the shop rows
+    and returns the table."""
+    if responses is None or responses.empty:
+        return None
+    day = responses["Submitted"].dt.date
+    named = responses[(day >= start_date) & (day <= end_date)]
+    received = named["Branch"].astype(str).str.strip().str.lower().value_counts()
+    hits = matches.merge(df[["Order ID", "Location"]], on="Order ID")
+    how = hits.pivot_table(index="Location", columns="How", values="Form", aggfunc="count").fillna(0)
+    table = pd.DataFrame({"Location": shops["Location"]})
+    table["Forms Received"] = table["Location"].str.lower().map(received).fillna(0).astype(int)
+    for col in ("Phone", "Near-miss phone", "Name"):
+        table[f"Matched by {col}"] = table["Location"].map(how.get(col, pd.Series(dtype=float))).fillna(0).astype(int)
+    table["Forms Matched"] = table[[c for c in table if c.startswith("Matched by")]].sum(axis=1)
+    shops[["Forms Received", "Forms Matched"]] = table[["Forms Received", "Forms Matched"]].to_numpy()
+    return table.sort_values("Forms Received", ascending=False)
 
 
 def _weights_text(measures: list) -> str:
@@ -964,7 +1019,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
                  else f"{r['Response Time (min)']:.1f} min",
                  f"target {scorecards.RESPONSE_TARGET_MIN} min"),
                 ("Customer Feedback", _pct(r["Feedback %"]),
-                 f"{r['Feedback']:,.0f} customers · target {scorecards.FEEDBACK_TARGET}%"
+                 f"{r['Feedback']:,.0f} customers · {r.get('Forms Received', 0):,.0f} forms named the shop"
                  if pd.notna(r["Feedback"]) else None),
                 ("Training Completion", _pct(r["Training Completion %"]),
                  f"average score {_pct(r['Training %'])}"),
@@ -973,6 +1028,21 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
                  f"last count {pd.Timestamp(r['Last Stock Count']):%d %b}"
                  if pd.notna(r["Last Stock Count"]) else "no stock count"),
             ], scorecards.HEAD_MEASURES)
+        matching = data.get("feedback_matching")
+        if matching is not None:
+            with st.expander("Customer feedback: forms received vs matched to a sale"):
+                st.caption(
+                    "Forms that named each shop in the period, and the forms matched to one of its "
+                    "sales in the period. A form is matched to the purchase it is about — the "
+                    f"customer's latest order before it, up to {scorecards.FEEDBACK_WINDOW_DAYS} "
+                    "days, so forms sent after the period still count. When the phone on the "
+                    "form isn't the one on the POS, it is matched by **name** (the first name on "
+                    "the form against customer names on the shop's orders in the "
+                    f"{scorecards.NAME_MATCH_DAYS} days before), and a number one or two "
+                    "digits off a customer's at the shop counts as theirs. Forms received can "
+                    "still be higher: forms about a purchase before the period, and forms with "
+                    "neither a matching number nor name.")
+                grid.filterable_table(matching, pinned_columns=("Location",), height=360)
         with st.container(border=True):
             st.caption("All shops side by side, best weighted score first, with each measure's "
                        "score and the figures behind it.")

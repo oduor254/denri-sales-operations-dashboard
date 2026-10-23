@@ -146,32 +146,143 @@ def retention(current: pd.DataFrame, previous: pd.DataFrame, group: list[str]) -
     return out
 
 
+FEEDBACK_WINDOW_DAYS = 30   # a form counts for a purchase up to this long after it
+FORM_LEAD_HOURS = 12        # ...or rung up to this long after the form: customers fill
+                            # the form at the counter, for the feedback discount,
+                            # before the sale is rung (most forms come before)
+NAME_MATCH_DAYS = 3         # name fallback: purchases at the shop this many days before
+PHONE_MAX_DIGITS_OFF = 2    # near-miss fallback: a number this many digits off
+
+
+def _first_name(text) -> str | None:
+    words = [w for w in "".join(c if c.isalpha() else " " for c in str(text or "")).lower().split()
+             if len(w) >= 3]
+    return words[0] if words else None
+
+
+def match_feedback(orders: pd.DataFrame, responses: pd.DataFrame | None) -> pd.DataFrame:
+    """Each feedback form matched to the purchase it is about: one row per
+    matched form with Order ID, Staff Rating and How it was matched.
+
+    1. Phone: the customer's order closest in time to the form, from
+       FEEDBACK_WINDOW_DAYS before it to FORM_LEAD_HOURS after it. Most forms
+       are filled at the counter before the sale is rung (the feedback
+       discount); a form sent days after the purchase — or after the period
+       on screen — still counts for it, and a returning customer's new form
+       counts for their new purchase. An order at the shop the form names
+       is preferred.
+    2. Near-miss phone: the number on the form is one or two digits off a
+       customer's at that shop in the window — a typo or two digits swapped
+       (722571032 for 722571302).
+    3. Name: the number on the form is not the one on the POS at all — the
+       first name on the form against the customer names on that shop's
+       orders from NAME_MATCH_DAYS before to FORM_LEAD_HOURS after; the
+       closest one in time wins.
+    Matching on time alone (the order rung just before the form) was tried
+    and dropped: nearly every order carries its customer's name, and the
+    order just before a form was usually someone else's.
+    Each order is credited once; orders needs Order ID, Location, Customer,
+    Ordered At and Customer Name (queries.SCORECARD_ORDERS).
+    """
+    cols = ["Form", "Order ID", "Submitted", "Staff Rating", "How"]
+    if responses is None or responses.empty or orders.empty or "Ordered At" not in orders:
+        return pd.DataFrame(columns=cols)
+    forms = responses.reset_index(drop=True).assign(Form=lambda f: f.index)
+    forms["Shop"] = forms["Branch"].astype(str).str.strip().str.lower()
+    if "Staff Rating" not in forms:
+        forms["Staff Rating"] = np.nan
+    o = orders[["Order ID", "Location", "Customer", "Ordered At", "Customer Name"]].copy()
+    o["Ordered At"] = pd.to_datetime(o["Ordered At"])
+    o["Shop"] = o["Location"].str.lower()
+    window = pd.Timedelta(days=FEEDBACK_WINDOW_DAYS)
+
+    by_phone = forms.dropna(subset=["Phone Key"]).merge(
+        o.dropna(subset=["Customer"]), left_on="Phone Key", right_on="Customer",
+        suffixes=("", "_o"))
+    lead = pd.Timedelta(hours=FORM_LEAD_HOURS)
+    gap = by_phone["Submitted"] - by_phone["Ordered At"]
+    by_phone = by_phone[(gap <= window) & (gap >= -lead)]
+    by_phone["Same Shop"] = by_phone["Shop"] == by_phone["Shop_o"]
+    by_phone["Gap"] = (by_phone["Submitted"] - by_phone["Ordered At"]).abs()
+    by_phone = (by_phone.sort_values(["Same Shop", "Gap"], ascending=[False, True])
+                .drop_duplicates("Form"))
+    matched = by_phone.assign(How="Phone")[cols]
+
+    taken = set(matched["Order ID"])
+    rest = forms[~forms["Form"].isin(matched["Form"])]
+    o["First Names"] = o["Customer Name"].map(
+        lambda n: {w for w in "".join(c if c.isalpha() else " " for c in str(n or "")).lower().split()
+                   if len(w) >= 3})
+    found = []
+    for _, f in rest.sort_values("Submitted").iterrows():
+        near = o[(o["Shop"] == f["Shop"]) & (o["Ordered At"] <= f["Submitted"] + lead)
+                 & (f["Submitted"] - o["Ordered At"] <= window) & ~o["Order ID"].isin(taken)]
+        near = near.assign(Gap=(f["Submitted"] - near["Ordered At"]).abs())
+        hit = None
+        phone = f["Phone Key"]
+        if phone and isinstance(phone, str) and len(phone) == 9 and not near.empty:
+            off_by = near["Customer"].map(
+                lambda c: isinstance(c, str) and len(c) == 9 and c.isdigit()
+                and sum(a != b for a, b in zip(c, phone)) <= PHONE_MAX_DIGITS_OFF)
+            close = near[off_by.astype(bool).to_numpy()]
+            if close["Customer"].nunique() == 1:
+                hit = (close.sort_values("Gap").iloc[0]["Order ID"], "Near-miss phone")
+        name = _first_name(f["Name"])
+        if hit is None and name:
+            recent = near[f["Submitted"] - near["Ordered At"] <= pd.Timedelta(days=NAME_MATCH_DAYS)]
+            by_name = recent[recent["First Names"].map(lambda s: name in s).astype(bool).to_numpy()]
+            if not by_name.empty:
+                hit = (by_name.sort_values("Gap").iloc[0]["Order ID"], "Name")
+        if hit is not None:
+            taken.add(hit[0])
+            found.append({"Form": f["Form"], "Order ID": hit[0], "Submitted": f["Submitted"],
+                          "Staff Rating": f["Staff Rating"], "How": hit[1]})
+    return pd.concat([matched, pd.DataFrame(found, columns=cols)], ignore_index=True)
+
+
+def apply_feedback(df: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
+    """Feedback (a form matched to the order), Staff Rating (its average) and
+    Feedback Match (how) on each order of df."""
+    out = df.copy()
+    if matches is None or matches.empty:
+        out["Feedback"] = False if matches is not None else np.nan
+        out["Staff Rating"] = np.nan
+        out["Feedback Match"] = None
+        out["Feedback On"] = pd.NaT
+        return out
+    per = matches.groupby("Order ID").agg(rating=("Staff Rating", "mean"), how=("How", "first"),
+                                          on=("Submitted", "min"))
+    out["Feedback"] = out["Order ID"].isin(per.index)
+    out["Staff Rating"] = out["Order ID"].map(per["rating"])
+    out["Feedback Match"] = out["Order ID"].map(per["how"])
+    out["Feedback On"] = out["Order ID"].map(per["on"])
+    return out
+
+
 def gave_feedback(df: pd.DataFrame, responses: pd.DataFrame | None) -> pd.Series:
-    """Per order: did its customer send feedback on or after the day they bought?"""
+    """Per order: was a feedback form matched to it (see match_feedback)?"""
     if responses is None or responses.empty:
         return pd.Series(np.nan, index=df.index)
-    first = (responses.dropna(subset=["Phone Key"])
-             .groupby("Phone Key")["Submitted"].min().dt.normalize())
-    fed_on = df["Customer"].map(first)
-    return fed_on.notna() & (fed_on >= pd.to_datetime(df["Date"]))
+    return apply_feedback(df, match_feedback(df, responses))["Feedback"]
 
 
 def staff_ratings(df: pd.DataFrame, responses: pd.DataFrame | None) -> pd.Series:
-    """Per order: the average 1-5 staff rating its customer gave on feedback
-    forms sent on or after the day they bought (NaN when none)."""
-    if responses is None or responses.empty or "Staff Rating" not in responses:
+    """Per order: the average 1-5 staff rating on the forms matched to it."""
+    if responses is None or responses.empty:
         return pd.Series(np.nan, index=df.index)
-    rated = responses.dropna(subset=["Phone Key", "Staff Rating"])[
-        ["Phone Key", "Submitted", "Staff Rating"]]
-    orders = df[["Customer", "Date"]].reset_index().dropna(subset=["Customer"])
-    hits = orders.merge(rated, left_on="Customer", right_on="Phone Key")
-    hits = hits[hits["Submitted"].dt.normalize() >= pd.to_datetime(hits["Date"])]
-    return hits.groupby("index")["Staff Rating"].mean().reindex(df.index)
+    return apply_feedback(df, match_feedback(df, responses))["Staff Rating"]
+
+
+def _customer_key(df: pd.DataFrame) -> pd.Series:
+    """The customer's phone key, or — when the order carries none (the shop's
+    own number typed in) — the order itself, so a feedback form matched to
+    it by name or till time still counts as a customer who sent one."""
+    return df["Customer"].where(df["Customer"].notna(), "order:" + df["Order ID"].astype(str))
 
 
 def _customer_rates(df: pd.DataFrame, group: list[str]) -> pd.DataFrame:
     """Repeat and feedback rates over the customers in each group."""
-    known = df.dropna(subset=["Customer"])
+    known = df.assign(Customer=_customer_key(df))
     per = (known.groupby(group + ["Customer"])
            .agg(days=("Date", "nunique"), fed=("Feedback", "max"))
            .reset_index())
@@ -434,7 +545,8 @@ def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.
 
     # Customer service: the staff rating their customers gave (1-5).
     if "Staff Rating" in staffed:
-        rated = staffed.dropna(subset=["Staff Rating", "Customer"]).drop_duplicates(keys + ["Customer"])
+        rated = (staffed.assign(Customer=_customer_key(staffed)).dropna(subset=["Staff Rating"])
+                 .drop_duplicates(keys + ["Customer"]))
         table["Service Rating"] = rated.groupby(keys)["Staff Rating"].mean().reindex(table.index).round(2)
         table["Ratings"] = rated.groupby(keys).size().reindex(table.index)
     else:

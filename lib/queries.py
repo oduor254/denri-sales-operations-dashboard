@@ -4819,8 +4819,13 @@ SELECT k.id AS "Order ID", k.sale_date AS "Date", k.location AS "Location",
        k.corporate AS "Corporate",
        ROUND(t.revenue::NUMERIC, 2) AS "Revenue", t.bags AS "Bags",
        ROUND(t.new_bag_revenue::NUMERIC, 2) AS "New Bag Revenue",
-       COALESCE(k.customer_type, 'walkin') AS "Order Type", k.user_id AS "User ID"
+       COALESCE(k.customer_type, 'walkin') AS "Order Type", k.user_id AS "User ID",
+       -- For matching feedback forms (timestamped in Nairobi time) to the
+       -- purchase they are about when the phone numbers differ.
+       (k.date_order AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi') AS "Ordered At",
+       TRIM(cp.name) AS "Customer Name"
 FROM keyed k
+LEFT JOIN res_partner cp ON cp.id = k.partner_id
 JOIN totals t ON t.id = k.id
 WHERE t.revenue > 0
 """
