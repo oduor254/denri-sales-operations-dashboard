@@ -27,15 +27,22 @@ WORKSHEET = "Customer Feedback"
 # with in Odoo (denri_pos_request_hub.sheets_col_*).
 _TABS = {
     WORKSHEET: {"Submitted": ["timestamp"], "Name": ["first name"],
-                "Phone": ["phone number"], "Branch": ["which of our branches"]},
+                "Phone": ["phone number"], "Branch": ["which of our branches"],
+                "Staff Rating": ["assistance you received from our staff"]},
     "Uganda":  {"Submitted": ["timestamp"], "Name": ["first name"],
-                "Phone": ["phone"], "Branch": ["branch"]},
+                "Phone": ["phone"], "Branch": ["branch"],
+                "Staff Rating": ["assistance you received in finding"]},
     "Kampala": {"Submitted": ["timestamp"], "Name": ["first name"],
-                "Phone": ["phone"], "Branch": ["branch"]},
+                "Phone": ["phone"], "Branch": ["branch"],
+                "Staff Rating": ["assistance you received in finding"]},
     "Sinza":   {"Submitted": ["timestamp"], "Name": ["jina la kwanza"],
-                "Phone": ["nambari ya simu"], "Branch": ["tawi"]},
+                "Phone": ["nambari ya simu"], "Branch": ["tawi"],
+                "Staff Rating": ["msaada uliopokea"]},
 }
-_FIELDS = ["Submitted", "Name", "Phone", "Branch"]
+# Staff Rating: the 1-5 rating of the help the customer got from staff, the
+# "Excellent customer service" measure on the attendant score cards (the
+# Uganda, Kampala and Sinza forms ask about help finding/choosing the bag).
+_FIELDS = ["Submitted", "Name", "Phone", "Branch", "Staff Rating"]
 
 
 class FeedbackUnavailable(Exception):
@@ -91,7 +98,7 @@ def _not_shared(exc: Exception) -> bool:
 
 @st.cache_data(ttl=600, show_spinner="Reading customer feedback…")
 def load() -> pd.DataFrame:
-    """Every feedback response: Submitted, Name, Phone, Branch, Form, Phone Key."""
+    """Every feedback response: Submitted, Name, Phone, Branch, Staff Rating (1-5), Form, Phone Key."""
     try:
         # All four forms' tabs in one batched read.
         _, tabs = sheets_sync.read_tabs(SPREADSHEET_ID, list(_TABS))
@@ -107,4 +114,5 @@ def load() -> pd.DataFrame:
     out = out[out["Submitted"].ne("")]
     out["Submitted"] = _parse_timestamps(out["Submitted"])
     out["Phone Key"] = out["Phone"].map(phone_key)
+    out["Staff Rating"] = pd.to_numeric(out["Staff Rating"].str.extract(r"([1-5])")[0], errors="coerce")
     return out.reset_index(drop=True)

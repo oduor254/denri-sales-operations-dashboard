@@ -4772,7 +4772,11 @@ orders AS (
         END AS location,
         CASE WHEN NULLIF(TRIM(ba.name), '') IS NOT NULL THEN TRIM(ba.name) || ' (BA)'
              ELSE COALESCE(NULLIF(TRIM(att_p.name), ''), 'Not recorded') END AS person,
-        COALESCE(NULLIF(po.currency_rate, 0), 1) AS rate
+        COALESCE(NULLIF(po.currency_rate, 0), 1) AS rate,
+        -- walkin / online / activation / employee: tells the day's role
+        -- (floor or WhatsApp) of whoever served it.
+        po.customer_type,
+        CASE WHEN NULLIF(TRIM(ba.name), '') IS NULL THEN po.attendant_id END AS user_id
     FROM pos_order po
     LEFT JOIN pos_session          ps     ON ps.id = po.session_id
     LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
@@ -4792,7 +4796,11 @@ totals AS (
                                                                     AS revenue,
            SUM(CASE WHEN (pc.complete_name ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
                      AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
-                    THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0 END) AS bags
+                    THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0 END) AS bags,
+           -- Bags Odoo flags as new (product_template.analytics_new_bag).
+           SUM(CASE WHEN COALESCE(pt.analytics_new_bag, FALSE)
+                    THEN pol.price_subtotal_incl + COALESCE(ref.amount, 0) ELSE 0 END) / MAX(o.rate)
+                                                                    AS new_bag_revenue
     FROM orders o
     JOIN pos_order_line       pol ON pol.order_id = o.id
     LEFT JOIN refunded        ref ON ref.line_id = pol.id
@@ -4809,10 +4817,66 @@ keyed AS (
 SELECT k.id AS "Order ID", k.sale_date AS "Date", k.location AS "Location",
        k.person AS "Served By", k.key AS "Customer", k.partner_id AS "Partner",
        k.corporate AS "Corporate",
-       ROUND(t.revenue::NUMERIC, 2) AS "Revenue", t.bags AS "Bags"
+       ROUND(t.revenue::NUMERIC, 2) AS "Revenue", t.bags AS "Bags",
+       ROUND(t.new_bag_revenue::NUMERIC, 2) AS "New Bag Revenue",
+       COALESCE(k.customer_type, 'walkin') AS "Order Type", k.user_id AS "User ID"
 FROM keyed k
 JOIN totals t ON t.id = k.id
 WHERE t.revenue > 0
+"""
+
+
+# The location naming every score card uses, for a pos_config row aliased
+# pconf with its warehouse sw / stock location sl joined.
+_SHOP_LOCATION = r"""
+        CASE
+            WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') THEN 'Website'
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                    COALESCE(sw.name, sl.complete_name, pconf.name), '\s*Shop\s*', '', 'gi')))
+        END"""
+
+# Each shop's head (shop manager), as set on its POS in Odoo.
+SHOP_HEADS = r"""
+SELECT DISTINCT ON (1)""" + _SHOP_LOCATION + r""" AS "Location",
+       TRIM(hp.name) AS "Head", pconf.head_user_id AS "Head User ID"
+FROM pos_config pconf
+JOIN res_users          hu ON hu.id = pconf.head_user_id
+JOIN res_partner        hp ON hp.id = hu.partner_id
+LEFT JOIN stock_picking_type spt ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse    sw  ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location     sl  ON sl.id = spt.default_location_src_id
+WHERE pconf.active
+ORDER BY 1, pconf.id
+"""
+
+# Shop stock counts (scan counts) submitted in the range, or in the two
+# weeks before it — counts run about weekly, so a one-day range still has
+# the latest count to judge stock protection by. Variance is the units the
+# count found off the system quantity, either way.
+STOCK_COUNTS = r"""
+SELECT""" + _SHOP_LOCATION + r""" AS "Location",
+       COUNT(DISTINCT s.id) AS "Counts", MAX(s.start_time)::DATE AS "Last Count",
+       SUM(l.system_qty) AS "System Qty", SUM(ABS(l.difference)) AS "Variance Qty"
+FROM denri_scan_count_session s
+JOIN denri_scan_count_line   l     ON l.session_id = s.id
+JOIN pos_config              pconf ON pconf.id = s.pos_config_id
+LEFT JOIN stock_picking_type spt   ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse    sw    ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location     sl    ON sl.id = spt.default_location_src_id
+WHERE s.state = 'submitted'
+  AND s.start_time::DATE BETWEEN CAST(:start_date AS DATE) - 14 AND CAST(:end_date AS DATE)
+GROUP BY 1
+"""
+
+# Clock-in attendance per POS user and day (denri_att_day), for "Be there".
+ATTENDANCE_DAYS = """
+SELECT e.user_id AS "User ID", d.date AS "Date", d.status AS "Status",
+       COALESCE(d.late_minutes, 0) AS "Late Minutes"
+FROM denri_att_day d
+JOIN hr_employee e ON e.id = d.employee_id
+WHERE e.user_id IS NOT NULL
+  AND d.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
 """
 
 

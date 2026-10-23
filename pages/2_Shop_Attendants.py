@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from lib import db, feedback, filters, grid, queries, report, scorecards, targets, theme, training
+from lib import db, feedback, filters, footfall, grid, queries, report, scorecards, targets, theme, training
 
 st.set_page_config(page_title="Shop Attendants · Denri Sales Operations Dashboard",
                    page_icon="🧑‍💼", layout="wide")
@@ -235,19 +235,25 @@ def _ranking_table(per: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-SCORE_SHOP_COLUMNS = (["Location", "Score"] + scorecards.SCORE_COLUMNS
-                      + ["Revenue", "Target", "Target %", "Corporate Revenue",
-                         "Corporate Target", "Corporate %", "Orders",
-                         "Basket Value", "Basket Value %", "Bags", "Basket Size", "Attendants",
-                         "Revenue per Attendant", "Customers", "Repeat %", "Previous Customers",
-                         "Retained", "Retention %", "Feedback", "Feedback %", "Training %",
-                         "Chats", "Response Time (min)"])
-SCORE_PEOPLE_COLUMNS = (["Attendant / BA", "Location", "Score"] + scorecards.ATTENDANT_SCORE_COLUMNS
+SCORE_SHOP_COLUMNS = (["Location", "Head", "Score", "Weight Covered %"] + scorecards.HEAD_SCORE_COLUMNS
+                      + ["Revenue", "Target", "Target %", "Orders", "Basket Value", "Basket Value %",
+                         "Walk-ins", "Walk-in Orders", "Walk-in Conversion %",
+                         "WhatsApp Chats", "WhatsApp Converted", "WhatsApp Conversion %",
+                         "Chats", "Response Time (min)", "Customers", "Feedback", "Feedback %",
+                         "Training Completion %", "Training %", "Stock Variance %",
+                         "Last Stock Count", "Attendants", "Revenue per Attendant", "Bags",
+                         "Basket Size", "Repeat %", "Retention %", "Corporate Revenue"])
+SCORE_PEOPLE_COLUMNS = (["Attendant / BA", "Location", "Score", "Weight Covered %"]
+                        + scorecards.ATTENDANT_SCORE_COLUMNS
                         + ["Days Worked", "Avg Team", "Target", "Revenue", "Target %",
-                           "Revenue per Day", "Orders", "Corporate Revenue",
-                           "Corporate Target", "Corporate %", "Basket Value", "Basket Value %",
-                           "Bags", "Basket Size", "Customers", "Feedback", "Feedback %",
-                           "Training %"])
+                           "Bulk Revenue", "Bulk Target", "Bulk %", "Orders", "Basket Value",
+                           "Basket Value %", "New Bag Revenue", "New Products %",
+                           "Customers Served", "Walk-in Orders", "Conversion %",
+                           "WhatsApp Days", "Chats Answered", "Fast Reply %",
+                           "Service Rating", "Ratings", "Customers", "Feedback", "Feedback %",
+                           "Captured Orders", "Capture %", "Training %", "Attendance %",
+                           "Late Days", "Revenue per Day", "Bags", "Basket Size",
+                           "Corporate Revenue"])
 
 
 def _export_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
@@ -318,16 +324,17 @@ def _build_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
         if person != ALL_PEOPLE:
             people = people[people["Attendant / BA"] == person]
         tables += [
-            report.Table("Shop Score Cards", shops[SCORE_SHOP_COLUMNS],
-                         note="Every measure scored out of 100; Score is their average.",
-                         doc_columns=["Location", "Score", "Revenue", "Target %", "Basket Value",
-                                      "Repeat %", "Retention %", "Feedback %", "Training %"]),
+            report.Table("Shop Manager Score Cards", shops[SCORE_SHOP_COLUMNS],
+                         note="Weighted score — " + _weights_text(scorecards.HEAD_MEASURES)
+                              + ". Each measure scored out of 100 against its target.",
+                         doc_columns=["Location", "Head", "Score"] + scorecards.HEAD_SCORE_COLUMNS),
             report.Table("Attendant Score Cards", people[SCORE_PEOPLE_COLUMNS],
-                         note="Revenue is what the person sold; Target is the shop's daily target "
-                              "shared equally between everyone on the floor each day they worked.",
-                         doc_columns=["Attendant / BA", "Location", "Score", "Revenue", "Target",
-                                      "Target %", "Days Worked", "Basket Value", "Feedback %",
-                                      "Training %"]),
+                         note="Weighted score — " + _weights_text(scorecards.ATTENDANT_MEASURES)
+                              + ". Measures a person had no part in are left out and the rest "
+                                "scaled up to 100% (Weight Covered %).",
+                         doc_columns=["Attendant / BA", "Location", "Score", "Weight Covered %",
+                                      "Personal Target Score", "Basket Score", "Conversion Score",
+                                      "Respond Fast Score", "Service Score", "Training Score"]),
         ]
         notes = [n for n in (data["feedback_note"], data["training_note"]) if n]
     tables.append(report.Table("Sessions", shown[COLUMNS].sort_values(["Date", "Location"]),
@@ -700,18 +707,28 @@ def _kpis_row(items: list[tuple[str, str, str | None]]) -> None:
             st.metric(label, value, note, delta_color="off")
 
 
-def _card(title: str, row: pd.Series, items: list[tuple[str, str, str | None]]) -> None:
-    """One score card: the cumulative score, the measures, then each
-    measure's own score."""
+def _card(title: str, row: pd.Series, items: list[tuple[str, str, str | None]],
+          measures: list) -> None:
+    """One score card: the weighted score, the measures, then each measure's
+    score with its weight, and which measures were left out."""
     with st.container(border=True):
         badge = "—" if pd.isna(row["Score"]) else f"{row['Score']:.0f}/100"
-        st.markdown(f"**{title}** &nbsp; · &nbsp; Cumulative score **{badge}**")
+        covered = row.get("Weight Covered %")
+        note = (f" &nbsp;·&nbsp; scored on {covered:.0f}% of the weighting"
+                if pd.notna(covered) and covered < 100 else "")
+        st.markdown(f"**{title}** &nbsp; · &nbsp; Weighted score **{badge}**{note}")
         for start in range(0, len(items), 4):
-            for col, (label, value, note) in zip(st.columns(4), items[start:start + 4]):
-                col.metric(label, value, note, delta_color="off")
-        parts = [f"{name.replace(' Score', '')} **{row[name]:.0f}**"
-                 for name in scorecards.SCORE_COLUMNS if name in row and pd.notna(row[name])]
-        st.caption("Scores out of 100 — " + " · ".join(parts))
+            for col, (label, value, sub) in zip(st.columns(4), items[start:start + 4]):
+                col.metric(label, value, sub, delta_color="off")
+        parts, left_out = [], []
+        for column, _, weight in measures:
+            name = column.replace(" Score", "")
+            if pd.notna(row.get(column)):
+                parts.append(f"{name} **{row[column]:.0f}** ({weight}%)")
+            else:
+                left_out.append(name)
+        st.caption("Scores out of 100 (weight) — " + " · ".join(parts)
+                   + (f". Left out, no data: {', '.join(left_out)}." if left_out else ""))
 
 
 def _money(v) -> str:
@@ -722,71 +739,98 @@ def _pct(v) -> str:
     return "—" if pd.isna(v) else f"{v:.1f}%"
 
 
-SCORE_COLORS = dict(zip(scorecards.SCORE_COLUMNS,
-                        [theme.CATEGORICAL[i] for i in (0, 2, 1, 3, 4, 6, 5, 7)]
-                        + [theme.OTHER]))
+_PALETTE = theme.CATEGORICAL + [theme.OTHER, theme.TEXT_SECONDARY, theme.SEQUENTIAL_BLUE[2]]
 
 
-def _cumulative_chart(table: pd.DataFrame, name: str, title: str) -> None:
-    """The cumulative score card: each bar is the cumulative score, split
-    into what each measure adds to it."""
+def _cumulative_chart(table: pd.DataFrame, name: str, title: str, measures: list) -> None:
+    """Each bar is the weighted score, split into what each measure adds to it
+    (its score × its weight, over the weight the person has data for)."""
     ranked = table.dropna(subset=["Score"]).sort_values("Score").tail(30)
     if ranked.empty:
         return
-    # Only the measures this table is scored on (attendants have no repeat
-    # or retention), and only ones with a score for someone.
-    columns = [c for c in scorecards.SCORE_COLUMNS if c in ranked and ranked[c].notna().any()]
-    n = len(columns)
+    covered = ranked["Weight Covered %"].where(ranked["Weight Covered %"] > 0)
     fig = go.Figure()
-    for column in columns:
-        part = ranked[column].fillna(0) / ranked[columns].notna().sum(axis=1)
+    for (column, _, weight), color in zip(measures, _PALETTE):
+        if column not in ranked or ranked[column].isna().all():
+            continue
+        part = ranked[column].fillna(0) * weight / covered
         fig.add_bar(y=ranked[name], x=part, orientation="h",
-                    name=column.replace(" Score", ""),
-                    marker=dict(color=SCORE_COLORS[column],
-                                line=dict(color=theme.CHART_SURFACE, width=1)),
+                    name=f"{column.replace(' Score', '')} ({weight}%)",
+                    marker=dict(color=color, line=dict(color=theme.CHART_SURFACE, width=1)),
                     customdata=ranked[[column]],
-                    hovertemplate=(f"<b>%{{y}}</b><br>{column}: <b>%{{customdata[0]:.0f}}</b>/100"
-                                   "<extra></extra>"))
+                    hovertemplate=(f"<b>%{{y}}</b><br>{column} ({weight}%): "
+                                   "<b>%{customdata[0]:.0f}</b>/100 · adds %{x:.1f}<extra></extra>"))
     for label, score in zip(ranked[name], ranked["Score"]):
         fig.add_annotation(x=score, y=label, text=f"<b>{score:.0f}</b>", showarrow=False,
                            xanchor="left", xshift=6, font=dict(color=theme.TEXT_PRIMARY, size=11))
     theme.apply_layout(fig, show_legend=True)
     fig.update_layout(title=title, barmode="stack", hovermode="closest",
-                      legend_traceorder="normal", height=max(400, 28 * len(ranked) + 110))
+                      legend_traceorder="normal", height=max(420, 28 * len(ranked) + 150))
     fig.update_xaxes(range=[0, 108], showgrid=True, gridcolor=theme.GRIDLINE)
     with st.container(border=True):
         theme.show(fig)
-        st.caption(f"Each bar is the cumulative score (the average of the {n} measure scores); "
-                   "the coloured parts show how much each measure adds to it.")
+        st.caption("Each bar is the weighted score; the coloured parts show what each measure "
+                   "adds to it (its score × its weight). Measures a person had no part in are "
+                   "left out and the rest scaled up to 100%.")
 
 
-def _response_times(start_date: date, end_date: date) -> pd.DataFrame | None:
-    """Average first response to WhatsApp chats per shop (WhatsApp Monitor)."""
+def _whatsapp_chats(start_date: date, end_date: date) -> pd.DataFrame | None:
+    """Every WhatsApp chat logged in the WhatsApp Monitor in the range."""
     try:
         chats = db.run_query(queries.WA_INTERACTIONS,
                              {"start_date": start_date, "end_date": end_date})
     except Exception:  # the dashboard user cannot read the monitor's tables
         return None
-    if chats.empty:
+    return chats if not chats.empty else None
+
+
+def _response_times(chats: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Average first response to WhatsApp chats per shop."""
+    if chats is None:
         return None
     chats = chats.assign(Minutes=pd.to_numeric(chats["First Response (min)"], errors="coerce"))
     g = chats.dropna(subset=["Minutes"]).groupby("Branch")["Minutes"]
     return pd.DataFrame({"Response Time (min)": g.mean().round(1), "Chats": g.size()})
 
 
+def _walkins(start_date: date, end_date: date) -> pd.DataFrame | None:
+    """Walk-ins per shop and day — the footfall module, with the Reporting
+    sheet filling its gaps (the Footfall Conversion page's rules)."""
+    params = {"start_date": start_date, "end_date": end_date}
+    try:
+        system = footfall.prepare_system(db.run_query(queries.FOOTFALL_SYSTEM_DAILY, params))
+    except Exception:
+        system = footfall.prepare_system(None)
+    try:
+        foot, rev = footfall.load()
+    except footfall.SheetUnavailable:
+        foot = pd.DataFrame(columns=["Shop", "Date", "Purchased", "Not Purchased"])
+        rev = pd.DataFrame(columns=["Shop", "Date", "Revenue"])
+    days = footfall.combine(foot, rev, system, pd.DataFrame(columns=["Shop", "Date", "Target"]),
+                            start_date, end_date)
+    if days.empty:
+        return None
+    out = days[days["Walk-ins"] > 0][["Shop", "Date", "Walk-ins"]].rename(columns={"Shop": "Location"})
+    out["Location"] = out["Location"].replace({v: k for k, v in footfall.SYSTEM_NAMES.items()})
+    return out
+
+
 def _training_scores(df: pd.DataFrame, start_date: date, end_date: date):
     """Sales training per shop and per attendant (matched to the team list
-    by name at their shop) over the closed questionnaires in the range."""
+    by name at their shop) over the closed questionnaires in the range, and
+    each shop's completion: the share of its team's questionnaires answered."""
     try:
         data = training.load()
     except training.TrainingUnavailable as exc:
-        return None, None, f"Sales training is left out: {exc}"
+        return None, None, None, f"Sales training is left out: {exc}"
     days = [d for d in data["days"] if start_date <= d <= end_date and d < date.today()]
     if not days:
-        return None, None, "No daily training questionnaire closed in this range, so Sales "                            "Training is not scored."
+        return None, None, None, ("No daily training questionnaire closed in this range, so "
+                                  "Sales Training is not scored.")
     rows = training.due(data, days)
     score = lambda v: v.fillna(0).mean() * 1.0
     shop = rows.groupby("Location")["Score %"].apply(score)
+    completion = rows.groupby("Location")["Answered"].mean() * 100
     by_email = rows.groupby("Email")["Score %"].apply(score)
     pairs = df.loc[df["Served By"] != scorecards.NOT_RECORDED, ["Served By", "Location"]].drop_duplicates()
     emails = [training.match_person(p, loc, data["roster"])
@@ -797,14 +841,23 @@ def _training_scores(df: pd.DataFrame, start_date: date, end_date: date):
     note = (f"Sales Training covers {len(days)} questionnaire(s). {unmatched} attendant(s)/BA(s) "
             "could not be matched to the training team list by name and are scored without it."
             if unmatched else None)
-    return shop, person, note
+    return shop, person, completion, note
+
+
+def _optional(sql: str, params: dict | None = None) -> pd.DataFrame | None:
+    """A query for one score-card measure: if it fails, the measure is left
+    out rather than the whole section."""
+    try:
+        return db.run_query(sql, params or {})
+    except Exception:
+        return None
 
 
 def _scorecard_data(start_date: date, end_date: date) -> dict | None:
-    """Shop and attendant score cards for the range (None if nothing sold),
-    shared by the Score Cards section and the exported report."""
-    orders = db.run_query(queries.SCORECARD_ORDERS,
-                          {"start_date": start_date, "end_date": end_date})
+    """Shop manager and attendant score cards for the range (None if nothing
+    sold), shared by the Score Cards section and the exported report."""
+    params = {"start_date": start_date, "end_date": end_date}
+    orders = db.run_query(queries.SCORECARD_ORDERS, params)
     if orders.empty:
         return None
     # The same number of days just before, for retention: 8-14 Oct is set
@@ -823,16 +876,27 @@ def _scorecard_data(start_date: date, end_date: date) -> dict | None:
     except feedback.FeedbackUnavailable as exc:
         responses, feedback_note = None, str(exc)
     df["Feedback"] = scorecards.gave_feedback(df, responses)
-    rows = db.run_query(queries.SALES_TARGET_ROWS,
-                        {"start_date": start_date, "end_date": end_date})
+    df["Staff Rating"] = scorecards.staff_ratings(df, responses)
+    rows = db.run_query(queries.SALES_TARGET_ROWS, params)
     basis = targets.basis_for(start_date, end_date, rows)
-    shop_training, person_training, training_note = _training_scores(df, start_date, end_date)
+    shop_training, person_training, completion, training_note = _training_scores(
+        df, start_date, end_date)
     day_targets = targets.daily(rows, start_date, end_date)
-    shops = scorecards.shop_cards(df, previous, day_targets,
-                                  shop_training, _response_times(start_date, end_date))
-    people = scorecards.attendant_cards(df, previous, day_targets, person_training)
+    chats = _whatsapp_chats(start_date, end_date)
+    walkins = _walkins(start_date, end_date)
+    shops = scorecards.shop_cards(
+        df, previous, day_targets, shop_training, _response_times(chats),
+        training_completion=completion, walkins=walkins, wa=chats,
+        stock=_optional(queries.STOCK_COUNTS, params), heads=_optional(queries.SHOP_HEADS))
+    people = scorecards.attendant_cards(
+        df, previous, day_targets, person_training, walkins=walkins, wa=chats,
+        attendance=_optional(queries.ATTENDANCE_DAYS, params))
     return {"shops": shops, "people": people, "basis": basis, "prev_start": prev_start,
             "prev_end": prev_end, "feedback_note": feedback_note, "training_note": training_note}
+
+
+def _weights_text(measures: list) -> str:
+    return " · ".join(f"{c.replace(' Score', '')} {w}%" for c, _, w in measures)
 
 
 def _score_cards(start_date: date, end_date: date, location: str, person: str) -> None:
@@ -840,134 +904,150 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
     if data is None:
         st.info("No sales in this date range.")
         return
-    basis, prev_start, prev_end = data["basis"], data["prev_start"], data["prev_end"]
     feedback_note, training_note = data["feedback_note"], data["training_note"]
     basket = f"KES {scorecards.BASKET_TARGET:,}"
     last = min(end_date, date.today())
     days_so_far = max((last - start_date).days + 1, 0)
     due = f"daily targets, {days_so_far} day{'s' if days_so_far != 1 else ''}"
 
-    view = st.segmented_control("Score cards", ["🏪 Shop Score Cards", "🧑‍💼 Attendant Score Cards"],
-                                default="🏪 Shop Score Cards", key="score_view",
-                                label_visibility="collapsed") or "🏪 Shop Score Cards"
+    view = st.segmented_control("Score cards", ["🏪 Shop Manager Score Cards",
+                                                "🧑‍💼 Attendant Score Cards"],
+                                default="🏪 Shop Manager Score Cards", key="score_view",
+                                label_visibility="collapsed") or "🏪 Shop Manager Score Cards"
     st.caption(
-        "Every measure is scored out of 100 and the **cumulative score** is their average. "
-        "**Revenue** is scored day by day against daily targets: a shop's target is the sum of "
-        f"its daily targets for the {days_so_far} day(s) so far in the period "
-        f"({start_date:%d %b} – {last:%d %b}), **corporate revenue** against "
-        f"{scorecards.CORPORATE_SHARE:.0%} of the revenue target "
-        f"and **basket value** against {basket} for every shop and attendant — 100 "
-        f"means on target. **Feedback** is scored against {scorecards.FEEDBACK_TARGET}% of the "
-        f"customers served sending a form ({scorecards.FEEDBACK_TARGET}% or more scores 100). Basket size, repeat "
-        "purchase and retention have no target, so they are scored by rank: 100 is the best "
-        "shop (or, for basket size, attendant). Customers are unique people, known by phone "
-        "number. **Repeat Purchase** and **Retention** are scored for shops only, not "
-        "attendants. **Repeat Purchase** is the share of the period's customers who bought on two "
-        "or more different days in it. **Retention** is the share of the previous period's "
-        f"customers ({prev_start:%d %b} – {prev_end:%d %b}, the same number of days) who bought "
-        "again in this one, at the same shop. **Feedback** is the share who sent a feedback "
-        "form on or after the day they bought. **Sales Training** counts every daily "
-        "questionnaire due in the period at the score it got and a missed one at 0, against "
-        "a target of 100%. **WhatsApp Response** (shops only) is the average first reply "
-        "to WhatsApp chats logged in the WhatsApp Monitor, against "
-        f"{scorecards.RESPONSE_TARGET_MIN} minutes: {scorecards.RESPONSE_TARGET_MIN} or "
-        "quicker scores 100, twice as slow scores 50. Shop phone numbers typed in for "
-        "customers who "
-        "gave none are not counted as customers.")
+        "Every measure is scored out of 100 — the measure against its target, capped at 100 — "
+        "and the card's **weighted score** adds them up by their weights. Roles change from day "
+        "to day (a desk/printing person at Hilton and KTDA, whoever is on WhatsApp), so each "
+        "measure only counts the days a person did that work, read from the orders they were "
+        "recorded on: a **floor day** is a day they served a walk-in order, a **WhatsApp day** "
+        "a day they served one of the shop's online orders. A measure someone had no part in "
+        "over the period is left out and the rest scaled up to 100%, so nobody loses points for "
+        "work they were not given. Revenue targets are the shops' daily targets for the "
+        f"{days_so_far} day(s) so far ({start_date:%d %b} – {last:%d %b}).")
     if feedback_note:
-        st.warning(f"Feedback is left out: {feedback_note}", icon="🔒")
+        st.warning(f"Feedback and customer service are left out: {feedback_note}", icon="🔒")
     if training_note:
         st.caption(training_note)
 
-    if view == "🏪 Shop Score Cards":
+    if view == "🏪 Shop Manager Score Cards":
         shops = data["shops"]
         shown = shops if location == "All Locations" else shops[shops["Location"] == location]
-        _cumulative_chart(shown, "Location", "Cumulative Score Card — Shops")
+        st.caption(
+            f"**Shop manager (the shop's Head in Odoo) — weights:** "
+            f"{_weights_text(scorecards.HEAD_MEASURES)}. **Walk-in conversion** is walk-in "
+            "orders over walk-ins counted (footfall module, the Reporting sheet filling gaps) "
+            "and **WhatsApp conversion** chats that bought over chats — both against the "
+            "network's rate (at or above it scores 100). **Response time** is the average "
+            f"first reply against {scorecards.RESPONSE_TARGET_MIN} min. **Feedback** is "
+            f"customers sending a form against {scorecards.FEEDBACK_TARGET}%. **Training "
+            "completion** is the share of the team's questionnaires answered. **Protect "
+            "stock** is the variance the latest stock counts found (counts submitted in the "
+            f"period or the 2 weeks before): 0% scores 100, {scorecards.STOCK_VARIANCE_ZERO_AT:.0f}% "
+            "or more off scores 0.")
+        _cumulative_chart(shown.assign(Name=shown["Location"] + " — " + shown["Head"].fillna("no head set")),
+                          "Name", "Shop Manager Score Cards — Weighted", scorecards.HEAD_MEASURES)
         for _, r in shown.iterrows():
-            _card(r["Location"], r, [
-                ("Revenue", _money(r["Revenue"]),
+            head = r["Head"] if pd.notna(r["Head"]) else "no head set in Odoo"
+            _card(f"{r['Location']} — {head}", r, [
+                ("Shop Target", _money(r["Revenue"]),
                  f"{_pct(r['Target %'])} of {_money(r['Target'])} ({due})"
                  if pd.notna(r["Target %"]) else "no target"),
-                ("Corporate Revenue", _money(r["Corporate Revenue"]),
-                 f"{_pct(r['Corporate %'])} of {_money(r['Corporate Target'])}"
-                 if pd.notna(r["Corporate Target"]) else "no target"),
                 ("Basket Value", _money(r["Basket Value"]),
                  f"{_pct(r['Basket Value %'])} of {basket}"),
-                ("Basket Size", f"{r['Basket Size']:.2f} bags", f"{int(r['Orders']):,} orders"),
-                ("Revenue per Attendant", _money(r["Revenue per Attendant"]),
-                 f"{int(r['Attendants'])} attendants/BAs"),
-                ("Repeat Purchase", _pct(r["Repeat %"]),
-                 f"of {r['Customers']:,.0f} customers" if pd.notna(r["Customers"]) else None),
-                ("Retention", _pct(r["Retention %"]),
-                 f"{r['Retained']:,.0f} of {r['Previous Customers']:,.0f} came back"
-                 if pd.notna(r["Previous Customers"]) else None),
-                ("Feedback", _pct(r["Feedback %"]),
+                ("Walk-in Conversion", _pct(r["Walk-in Conversion %"]),
+                 f"{r['Walk-in Orders']:,.0f} of {r['Walk-ins']:,.0f} walk-ins"
+                 if pd.notna(r["Walk-ins"]) else "no footfall counted"),
+                ("WhatsApp Conversion", _pct(r["WhatsApp Conversion %"]),
+                 f"{r['WhatsApp Converted']:,.0f} of {r['WhatsApp Chats']:,.0f} chats"
+                 if pd.notna(r["WhatsApp Chats"]) else "no chats logged"),
+                ("Response Time", "—" if pd.isna(r["Response Time (min)"])
+                 else f"{r['Response Time (min)']:.1f} min",
+                 f"target {scorecards.RESPONSE_TARGET_MIN} min"),
+                ("Customer Feedback", _pct(r["Feedback %"]),
                  f"{r['Feedback']:,.0f} customers · target {scorecards.FEEDBACK_TARGET}%"
                  if pd.notna(r["Feedback"]) else None),
-                ("Sales Training", _pct(r["Training %"]), "target 100%"),
-                ("WhatsApp Response", "—" if pd.isna(r["Response Time (min)"])
-                 else f"{r['Response Time (min)']:.1f} min",
-                 f"average first reply · target {scorecards.RESPONSE_TARGET_MIN} min · "
-                 f"{r['Chats']:,.0f} chats" if pd.notna(r["Chats"]) else "no chats logged"),
-            ])
+                ("Training Completion", _pct(r["Training Completion %"]),
+                 f"average score {_pct(r['Training %'])}"),
+                ("Protect Stock", "—" if pd.isna(r["Stock Variance %"])
+                 else f"{r['Stock Variance %']:.1f}% variance",
+                 f"last count {pd.Timestamp(r['Last Stock Count']):%d %b}"
+                 if pd.notna(r["Last Stock Count"]) else "no stock count"),
+            ], scorecards.HEAD_MEASURES)
         with st.container(border=True):
-            st.caption("All shops side by side, best cumulative score first, with each measure's "
-                       "score and the total at the bottom.")
+            st.caption("All shops side by side, best weighted score first, with each measure's "
+                       "score and the figures behind it.")
             grid.filterable_table(shops[SCORE_SHOP_COLUMNS], pinned_columns=("Location",),
-                                  currency_columns=("Revenue", "Target", "Corporate Revenue", "Corporate Target",
+                                  currency_columns=("Revenue", "Target", "Corporate Revenue",
                                                     "Basket Value", "Revenue per Attendant"),
-                                  height=460)
+                                  total=False, height=460)
         return
 
     people = data["people"]
     if location != "All Locations":
         people = people[people["Location"] == location]
     st.caption(
-        "**Revenue target**: each day, the shop's daily target is shared equally between the "
-        "attendants and BAs on the floor that day (recorded on at least one of its orders) — "
-        "a KES 100,000 day with two people gives each KES 50,000 — and a person's target is "
-        "the sum of their shares over the days they worked. **Revenue** is what the person "
-        "sold themselves, so the % is their own sales over their share. The **corporate "
-        f"target** is {scorecards.CORPORATE_SHARE:.0%} of the revenue target. Basket value and "
-        "basket size are from the orders the person served.")
+        f"**Shop attendant / BA — weights:** {_weights_text(scorecards.ATTENDANT_MEASURES)}. "
+        "**Personal target**: each floor day the shop's daily target is shared equally between "
+        "everyone serving that day (a KES 100,000 day with two people gives each 50,000), "
+        "summed over their days; the % is their own sales over it. **Bulk orders** are "
+        f"corporate orders and orders of {scorecards.BULK_MIN_BAGS}+ bags, against "
+        f"{scorecards.BULK_SHARE:.0%} of their target. **Conversion** is their walk-in orders "
+        "over the customers they served — the shop's walk-ins each floor day split between "
+        "everyone serving walk-ins that day — against the network's rate. **New products** is "
+        "the share of their sales from bags Odoo flags as new, against the network's share. "
+        "**Respond fast** is the shop's WhatsApp chats answered within "
+        f"{scorecards.RESPONSE_TARGET_MIN} min on their WhatsApp days. **Customer service** is "
+        "the staff rating (1-5) on the feedback forms of customers they served. **Capture** is "
+        "their orders with a real customer phone number. **Be there** is being on time on the "
+        f"days they worked (late counts {scorecards.LATE_CREDIT:.0%}), for people who clock in "
+        "— most shop staff don't yet, so it is left out for them.")
     if people.empty:
         st.info("No attendants or BAs recorded in this range.")
         return
     people = people.assign(Name=people["Attendant / BA"] + " — " + people["Location"])
     chosen = people if person == ALL_PEOPLE else people[people["Attendant / BA"] == person]
-    _cumulative_chart(chosen, "Name", "Cumulative Score Card — Attendants & BAs")
+    _cumulative_chart(chosen, "Name", "Attendant Score Cards — Weighted",
+                      scorecards.ATTENDANT_MEASURES)
     for _, r in chosen.head(12).iterrows():
-        peers = people[people["Location"] == r["Location"]]
-        vs = lambda c, fmt: f"shop avg {fmt(peers[c].mean())}"
         _card(r["Name"], r, [
-            ("Revenue", _money(r["Revenue"]),
-             f"{_pct(r['Target %'])} of {_money(r['Target'])} (daily target shares)"
+            ("Personal Target", _money(r["Revenue"]),
+             f"{_pct(r['Target %'])} of {_money(r['Target'])} · {int(r['Days Worked'])} days"
              if pd.notna(r["Target %"]) else "no target"),
-            ("Revenue per Day", _money(r["Revenue per Day"]),
-             f"{int(r['Days Worked'])} days worked"),
-            ("Orders", f"{int(r['Orders']):,}",
-             f"average team on the floor {r['Avg Team']:.1f}" if pd.notna(r["Avg Team"]) else None),
-            ("Corporate Revenue", _money(r["Corporate Revenue"]),
-             f"{_pct(r['Corporate %'])} of {_money(r['Corporate Target'])}"
-             if pd.notna(r["Corporate Target"]) else "no target"),
+            ("Bulk Orders", _money(r["Bulk Revenue"]),
+             f"{_pct(r['Bulk %'])} of {_money(r['Bulk Target'])}"
+             if pd.notna(r["Bulk Target"]) else None),
             ("Basket Value", _money(r["Basket Value"]),
              f"{_pct(r['Basket Value %'])} of {basket}"),
-            ("Basket Size", f"{r['Basket Size']:.2f} bags",
-             vs("Basket Size", lambda v: f"{v:.2f}")),
-            ("Feedback", _pct(r["Feedback %"]),
+            ("New Products", _pct(r["New Products %"]), "of their sales"),
+            ("Conversion", _pct(r["Conversion %"]),
+             f"{r['Walk-in Orders']:,.0f} of {r['Customers Served']:,.0f} served"
+             if pd.notna(r["Customers Served"]) else "no floor days with footfall"),
+            ("Respond Fast", _pct(r["Fast Reply %"]),
+             f"{r['WhatsApp Days']:,.0f} WhatsApp day(s)" if pd.notna(r["WhatsApp Days"])
+             else "not on WhatsApp"),
+            ("Customer Service", "—" if pd.isna(r["Service Rating"])
+             else f"{r['Service Rating']:.2f} / 5",
+             f"{r['Ratings']:,.0f} rating(s)" if pd.notna(r["Ratings"]) else "no ratings"),
+            ("Customer Feedback", _pct(r["Feedback %"]),
              f"{r['Feedback']:,.0f} customers · target {scorecards.FEEDBACK_TARGET}%"
              if pd.notna(r["Feedback"]) else None),
-            ("Sales Training", _pct(r["Training %"]),
-             "target 100%" if pd.notna(r["Training %"]) else "not matched to the training list"),
-        ])
+            ("Capture the Customer", _pct(r["Capture %"]),
+             f"{r['Captured Orders']:,.0f} of {int(r['Orders']):,} orders"),
+            ("Know the Product", _pct(r["Training %"]),
+             "training score" if pd.notna(r["Training %"]) else "not matched to the training list"),
+            ("Be There", _pct(r["Attendance %"]),
+             f"{r['Late Days']:,.0f} late day(s)" if pd.notna(r["Attendance %"])
+             else "no clock-ins"),
+        ], scorecards.ATTENDANT_MEASURES)
     if person == ALL_PEOPLE and len(people) > 12:
-        st.caption(f"The 12 best cumulative scores are shown as cards; all {len(people)} are in "
+        st.caption(f"The 12 best weighted scores are shown as cards; all {len(people)} are in "
                    "the table. Pick a person at the top to see their card.")
     with st.container(border=True):
         grid.filterable_table(people[SCORE_PEOPLE_COLUMNS], pinned_columns=("Attendant / BA",),
-                              currency_columns=("Target", "Revenue", "Revenue per Day", "Corporate Target",
+                              currency_columns=("Target", "Revenue", "Revenue per Day",
+                                                "Bulk Revenue", "Bulk Target", "New Bag Revenue",
                                                 "Corporate Revenue", "Basket Value"),
-                              height=460)
+                              total=False, height=460)
 
 
 render_attendants(start_date, end_date)
