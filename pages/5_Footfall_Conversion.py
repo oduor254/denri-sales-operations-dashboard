@@ -229,6 +229,24 @@ if location == ALL and not channels.empty:
                + f" — KES {now['Revenue'] + parts.sum():,.0f} with them.")
 
 
+def _whatsapp_by_shop_day() -> pd.DataFrame | None:
+    """WhatsApp chats logged in the WhatsApp Monitor per shop and day, and
+    how many bought; None if the monitor can't be read."""
+    try:
+        wa = db.run_query(queries.WA_INTERACTIONS, {"start_date": start, "end_date": end})
+    except Exception:
+        return None
+    if wa.empty:
+        return pd.DataFrame(columns=["Shop", "Date", "Chats", "Converted"])
+    frame = pd.DataFrame({
+        "Shop": wa["Branch"].replace(ff.SYSTEM_NAMES),
+        "Date": pd.to_datetime(wa["Date"]).dt.date,
+        "Converted": wa["Converted"].fillna(False).astype(bool),
+    })
+    return (frame.groupby(["Shop", "Date"])
+            .agg(Chats=("Converted", "size"), Converted=("Converted", "sum")).reset_index())
+
+
 # --- Shop by day: the workbook's "Revenue Sales" sheet -----------------------
 def _shop_day_grid() -> None:
     """Every day of the period down the side and every shop across — sales,
@@ -241,9 +259,11 @@ def _shop_day_grid() -> None:
         return
     order = [s for s in shops if s in set(data["Shop"])]
     channel_rows = ff.other_channels(rev, system, start, end) if location == ALL else None
+    chats = _whatsapp_by_shop_day()
 
-    def figures(rows: pd.DataFrame, extra: pd.DataFrame | None) -> dict:
+    def figures(rows: pd.DataFrame, extra: pd.DataFrame | None, on: list) -> dict:
         out = {}
+        wa = chats[chats["Date"].isin(on)] if chats is not None else None
         for shop in order:
             r = rows[rows["Shop"] == shop]
             sales, target = r["Revenue"].sum(), r["Target"].sum(min_count=1)
@@ -254,6 +274,12 @@ def _shop_day_grid() -> None:
             out[f"{shop}|Walk-ins"] = walk if walk else None
             out[f"{shop}|Bought"] = bought if not r.empty else None
             out[f"{shop}|Conversion"] = counted / walk * 100 if walk else None
+            if wa is not None:
+                w = wa[wa["Shop"] == shop]
+                n, won = w["Chats"].sum(), w["Converted"].sum()
+                out[f"{shop}|WA Chats"] = n or None
+                out[f"{shop}|WA Bought"] = won if n else None
+                out[f"{shop}|WA Conversion"] = won / n * 100 if n else None
         sales, target = rows["Revenue"].sum(), rows["Target"].sum(min_count=1)
         walk, counted = rows["Walk-ins"].sum(), rows["Counted Purchased"].sum()
         out["Total|Sales"] = sales
@@ -261,6 +287,12 @@ def _shop_day_grid() -> None:
         out["Total|Walk-ins"] = walk or None
         out["Total|Bought"] = rows["Purchased"].sum()
         out["Total|Conversion"] = counted / walk * 100 if walk else None
+        if wa is not None:
+            w = wa[wa["Shop"].isin(order)]
+            n, won = w["Chats"].sum(), w["Converted"].sum()
+            out["Total|WA Chats"] = n or None
+            out["Total|WA Bought"] = won if n else None
+            out["Total|WA Conversion"] = won / n * 100 if n else None
         channels_total = 0.0
         for name in ff.OTHER_CHANNELS:
             v = extra[extra["Shop"] == name]["Revenue"].sum() if extra is not None else 0.0
@@ -278,12 +310,12 @@ def _shop_day_grid() -> None:
     for week, week_days in weeks.items():
         for d in week_days:
             lines.append({"Week": f"Week {week}", "Date": f"{d:%a %d %b}",
-                          **figures(pick(data, [d]), pick(channel_rows, [d]))})
+                          **figures(pick(data, [d]), pick(channel_rows, [d]), [d])})
         if len(weeks) > 1 or len(week_days) > 1:
             lines.append({"Week": f"Week {week} Total", "Date": "",
-                          **figures(pick(data, week_days), pick(channel_rows, week_days))})
+                          **figures(pick(data, week_days), pick(channel_rows, week_days), week_days)})
     if len(weeks) > 1:
-        lines.append({"Week": "Period Total", "Date": "", **figures(data, channel_rows)})
+        lines.append({"Week": "Period Total", "Date": "", **figures(data, channel_rows, days)})
     table = pd.DataFrame(lines)
 
     latest = data.dropna(subset=["Target"]).sort_values("Date").groupby("Shop")["Target"].last()
@@ -293,11 +325,16 @@ def _shop_day_grid() -> None:
         groups.append((head, [(f"{shop}|Sales", "Sales", "money"), (f"{shop}|Rate", "Rate", "pct"),
                               (f"{shop}|Walk-ins", "Walk-ins", "int"),
                               (f"{shop}|Bought", "Bought", "int"),
-                              (f"{shop}|Conversion", "Conversion", "pct")]))
+                              (f"{shop}|Conversion", "Conversion", "pct")]
+                       + ([(f"{shop}|WA Chats", "WA Chats", "int"),
+                           (f"{shop}|WA Bought", "WA Bought", "int"),
+                           (f"{shop}|WA Conversion", "WA Conversion", "pct")] if chats is not None else [])))
     groups.append(("Summary — shops" if location == ALL else f"Summary — {location}",
                    [("Total|Sales", "Total Sales", "money"), ("Total|Rate", "% of Target", "pct"),
                     ("Total|Walk-ins", "Total Walk-ins", "int"), ("Total|Bought", "Bought", "int"),
-                    ("Total|Conversion", "Conversion", "pct")]))
+                    ("Total|Conversion", "Conversion", "pct")]
+                   + ([("Total|WA Chats", "WA Chats", "int"), ("Total|WA Bought", "WA Bought", "int"),
+                       ("Total|WA Conversion", "WA Conversion", "pct")] if chats is not None else [])))
     if location == ALL:
         groups.append(("No walk-ins", [(f"Channel|{n}", n, "money") for n in ff.OTHER_CHANNELS]))
         groups.append(("Daily Total", [("Daily Total|Sales", "All Sales", "money")]))
@@ -305,8 +342,9 @@ def _shop_day_grid() -> None:
     st.subheader("Sales & Conversion by Shop and Day")
     st.caption("The weekly Sales vs Conversion workbook's Revenue Sales sheet: each shop's sales, "
                "the % of its daily target (Rate), walk-ins, how many bought and the conversion, "
-               "day by day, with the shops' summary, the channels without walk-ins and the "
-               "day's total on the right. Week subtotals and the period total are worked out on "
+               "then its WhatsApp chats (WhatsApp Monitor), how many bought and the WhatsApp "
+               "conversion, day by day, with the shops' summary, the channels without walk-ins "
+               "and the day's total on the right. Week subtotals and the period total are worked out on "
                "the sums. Scroll sideways for every shop; Date and Week stay put.")
     with st.container(border=True):
         grid.grouped_table(table, groups, pinned=2, bold_rows="Total",
