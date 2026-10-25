@@ -101,20 +101,22 @@ ATTENDANT_MEASURES = [
     ("Training Score", "Training %", 5),
     ("Attendance Score", "Attendance %", 5),
 ]
-# The shop's own card: its business as a whole, every measure counting
-# equally (no weights agreed for it). Basket size, repeat purchase and
-# retention have no target, so they are ranked against the other shops:
-# 100 is the best shop.
+# The shop's own card: its business as a whole, weighted like the other two
+# cards — each measure takes the weight its counterpart carries on the shop
+# manager's card (bulk orders' on the attendant's for corporate revenue).
+# Basket size, repeat purchase and retention have no counterpart and share
+# the remaining 30%; having no target, they are ranked against the other
+# shops (100 is the best shop).
 SHOP_MEASURES = [
-    ("Revenue Score", "Target %", 1),
-    ("Corporate Score", "Corporate %", 1),
-    ("Basket Value Score", "Basket Value %", 1),
-    ("Basket Size Score", "Basket Size Rank %", 1),
-    ("Repeat Score", "Repeat Rank %", 1),
-    ("Retention Score", "Retention Rank %", 1),
-    ("Feedback Score", "Feedback of Target %", 1),
-    ("Training Score", "Training %", 1),
-    ("Response Score", "Response vs Target %", 1),
+    ("Revenue Score", "Target %", 30),              # manager: hit shop target
+    ("Corporate Score", "Corporate %", 5),          # attendant: bulk orders
+    ("Basket Value Score", "Basket Value %", 10),   # manager: basket value
+    ("Basket Size Score", "Basket Size Rank %", 10),
+    ("Repeat Score", "Repeat Rank %", 10),
+    ("Retention Score", "Retention Rank %", 10),
+    ("Feedback Score", "Feedback of Target %", 8),  # manager: customer feedback
+    ("Training Score", "Training %", 10),           # manager: training plan
+    ("Response Score", "Response vs Target %", 7),  # manager: response time
 ]
 SHOP_SCORE_COLUMNS = [m[0] for m in SHOP_MEASURES]
 HEAD_SCORE_COLUMNS = [m[0] for m in HEAD_MEASURES]
@@ -487,7 +489,7 @@ def shop_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataF
 
 def shop_overall(shops: pd.DataFrame) -> pd.DataFrame:
     """The shops' own score cards from shop_cards()'s rows: the shop's
-    business as a whole on SHOP_MEASURES, each counting equally."""
+    business as a whole, weighted on SHOP_MEASURES."""
     return weighted(shops, SHOP_MEASURES).sort_values("Score", ascending=False)
 
 

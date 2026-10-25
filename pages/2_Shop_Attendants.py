@@ -327,7 +327,8 @@ def _build_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
             people = people[people["Attendant / BA"] == person]
         tables += [
             report.Table("Shop Score Cards", overall[SHOP_CARD_COLUMNS],
-                         note="The shop as a whole; every measure counts equally.",
+                         note="The shop as a whole — weighted score: "
+                              + _weights_text(scorecards.SHOP_MEASURES) + ".",
                          doc_columns=["Location", "Score"] + scorecards.SHOP_SCORE_COLUMNS),
             report.Table("Shop Manager Score Cards", shops[SCORE_SHOP_COLUMNS],
                          note="Weighted score — " + _weights_text(scorecards.HEAD_MEASURES)
@@ -992,7 +993,10 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
     shops = data["shop_cards"]
     shown = shops if location == "All Locations" else shops[shops["Location"] == location]
     st.caption(
-        "**The shop as a whole** — every measure counts equally. **Revenue** against the shop's "
+        f"**The shop as a whole — weights:** {_weights_text(scorecards.SHOP_MEASURES)}, each "
+        "taken from the same measure on the shop manager's card (corporate revenue from bulk "
+        "orders on the attendant's; basket size, repeat and retention share the rest). "
+        "**Revenue** against the shop's "
         f"daily targets, **corporate revenue** against {scorecards.CORPORATE_SHARE:.0%} of the "
         f"revenue target, **basket value** against {basket}, **feedback** against "
         f"{scorecards.FEEDBACK_TARGET}% of customers sending a form, **training** (missed "
@@ -1028,8 +1032,8 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
              f"target {scorecards.RESPONSE_TARGET_MIN} min"),
         ], scorecards.SHOP_MEASURES)
     with st.container(border=True):
-        st.caption("All shops side by side, best score first, with each measure's score and the "
-                   "figures behind it.")
+        st.caption("All shops side by side, best weighted score first, with each measure's score "
+                   "and the figures behind it.")
         grid.filterable_table(shops[[c for c in SHOP_CARD_COLUMNS if c in shops]],
                               pinned_columns=("Location",),
                               currency_columns=("Revenue", "Target", "Corporate Revenue",
