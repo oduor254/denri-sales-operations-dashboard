@@ -725,31 +725,47 @@ def _kpis_row(items: list[tuple[str, str, str | None]]) -> None:
             st.metric(label, value, note, delta_color="off")
 
 
-def _card(title: str, row: pd.Series, items: list[tuple[str, str, str | None]],
-          measures: list) -> None:
-    """One score card: the weighted score, the measures, then each measure's
-    score with its weight, and which measures were left out."""
+def _display_weights(measures: list) -> dict:
+    """Each measure's weight as shown on a card: the agreed weight, or — when
+    every measure counts the same (the shop cards) — its equal share."""
+    if len({m[2] for m in measures}) == 1:
+        return {m[0]: 100 / len(measures) for m in measures}
+    return {m[0]: m[2] for m in measures}
+
+
+def _card(title: str, row: pd.Series, items: list, measures: list) -> None:
+    """One score card: the weighted score and the share of the weights it
+    stands on, then each measure — its weight in the label, and under its
+    value the score it got and the points that earns (score × weight).
+
+    items are (label, value, note) or (label, value, note, score column);
+    3-tuples are matched to measures in order, so list them in the same
+    order. A measure with no data shows as left out, earning no points."""
+    weights = _display_weights(measures)
+    columns = [m[0] for m in measures]
+    applied = sum(w for c, w in weights.items() if pd.notna(row.get(c)))
     with st.container(border=True):
         badge = "—" if pd.isna(row["Score"]) else f"{row['Score']:.0f}/100"
-        covered = row.get("Weight Covered %")
-        note = (f" &nbsp;·&nbsp; scored on {covered:.0f}% of the weighting"
-                if pd.notna(covered) and covered < 100 else "")
         label = "Score" if len({m[2] for m in measures}) == 1 else "Weighted score"
-        st.markdown(f"**{title}** &nbsp; · &nbsp; {label} **{badge}**{note}")
-        for start in range(0, len(items), 4):
-            for col, (label, value, sub) in zip(st.columns(4), items[start:start + 4]):
-                col.metric(label, value, sub, delta_color="off")
-        parts, left_out = [], []
-        for column, _, weight in measures:
-            name = column.replace(" Score", "")
-            if pd.notna(row.get(column)):
-                parts.append(f"{name} **{row[column]:.0f}**{_weight_label(measures, weight)}")
-            else:
-                left_out.append(name)
-        equal = len({m[2] for m in measures}) == 1
-        st.caption(("Scores out of 100, each counting equally — " if equal
-                    else "Scores out of 100 (weight) — ") + " · ".join(parts)
-                   + (f". Left out, no data: {', '.join(left_out)}." if left_out else ""))
+        st.markdown(f"**{title}** &nbsp; · &nbsp; {label} **{badge}** &nbsp; "
+                    f"<span style='color:{theme.TEXT_MUTED}'>({applied:.0f}% of the weights "
+                    "applied)</span>", unsafe_allow_html=True)
+        cells = []
+        for i, item in enumerate(items):
+            name, value, note = item[:3]
+            column = item[3] if len(item) > 3 else (columns[i] if len(items) == len(columns) else None)
+            if column in weights:
+                weight = weights[column]
+                shown = f"{weight:.0f}" if float(weight).is_integer() else f"{weight:.1f}"
+                name = f"{name} · {shown}%"
+                score = row.get(column)
+                tail = (f"score {score:.0f} · {score * weight / 100:.1f} of {shown} pts"
+                        if pd.notna(score) else "no data · left out")
+                note = f"{note} · {tail}" if note else tail
+            cells.append((name, value, note))
+        for start in range(0, len(cells), 4):
+            for col, (name, value, note) in zip(st.columns(4), cells[start:start + 4]):
+                col.metric(name, value, note, delta_color="off")
 
 
 def _money(v) -> str:
@@ -998,8 +1014,6 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
             ("Basket Value", _money(r["Basket Value"]),
              f"{_pct(r['Basket Value %'])} of {basket}"),
             ("Basket Size", f"{r['Basket Size']:.2f} bags", f"{int(r['Orders']):,} orders"),
-            ("Revenue per Attendant", _money(r["Revenue per Attendant"]),
-             f"{int(r['Attendants'])} attendants/BAs"),
             ("Repeat Purchase", _pct(r["Repeat %"]),
              f"of {r['Customers']:,.0f} customers" if pd.notna(r["Customers"]) else None),
             ("Retention", _pct(r["Retention %"]),
@@ -1011,7 +1025,7 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
             ("Sales Training", _pct(r["Training %"]), "target 100%"),
             ("WhatsApp Response", "—" if pd.isna(r["Response Time (min)"])
              else f"{r['Response Time (min)']:.1f} min",
-             f"average first reply · target {scorecards.RESPONSE_TARGET_MIN} min"),
+             f"target {scorecards.RESPONSE_TARGET_MIN} min"),
         ], scorecards.SHOP_MEASURES)
     with st.container(border=True):
         st.caption("All shops side by side, best score first, with each measure's score and the "
@@ -1068,43 +1082,42 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         st.caption(
             f"**Shop manager (the shop's Head in Odoo) — weights:** "
             f"{_weights_text(scorecards.HEAD_MEASURES)}. **Walk-in conversion** is walk-in "
-            "orders over walk-ins counted (footfall module, the Reporting sheet filling gaps) "
-            "and **WhatsApp conversion** chats that bought over chats — both against the "
-            "network's rate (at or above it scores 100). **Response time** is the average "
+            "orders over walk-ins counted (footfall module, the Reporting sheet filling gaps); "
+            "the rate is the score (87.9% scores 88). **WhatsApp conversion** is chats that "
+            "bought over chats, against the network's rate (at or above it scores 100). "
+            "**Response time** is the average "
             f"first reply against {scorecards.RESPONSE_TARGET_MIN} min. **Feedback** is "
             f"customers sending a form against {scorecards.FEEDBACK_TARGET}%. **Training "
             "completion** is the share of the team's questionnaires answered. **Protect "
             "stock** is the variance the latest stock counts found (counts submitted in the "
-            f"period or the 2 weeks before): 0% scores 100, {scorecards.STOCK_VARIANCE_ZERO_AT:.0f}% "
-            "or more off scores 0.")
+            "period or the 2 weeks before): the score is 100 minus the variance, so 11.67% off "
+            "scores 88.")
         _cumulative_chart(shown.assign(Name=shown["Location"] + " — " + shown["Head"].fillna("no head set")),
                           "Name", "Shop Manager Score Cards — Weighted", scorecards.HEAD_MEASURES)
         for _, r in shown.iterrows():
             head = r["Head"] if pd.notna(r["Head"]) else "no head set in Odoo"
-            _card(f"{r['Location']} — {head}", r, [
+            _card(f"{r['Location']} — {head} (head)" if pd.notna(r["Head"]) else
+                  f"{r['Location']} — {head}", r, [
                 ("Shop Target", _money(r["Revenue"]),
-                 f"{_pct(r['Target %'])} of {_money(r['Target'])} ({due})"
+                 f"{_pct(r['Target %'])} of {_money(r['Target'])}"
                  if pd.notna(r["Target %"]) else "no target"),
-                ("Basket Value", _money(r["Basket Value"]),
-                 f"{_pct(r['Basket Value %'])} of {basket}"),
+                ("Basket Value", _money(r["Basket Value"]), f"target {basket}"),
                 ("Walk-in Conversion", _pct(r["Walk-in Conversion %"]),
-                 f"{r['Walk-in Orders']:,.0f} of {r['Walk-ins']:,.0f} walk-ins"
+                 f"{r['Walk-in Orders']:,.0f} of {r['Walk-ins']:,.0f} walk-ins bought"
                  if pd.notna(r["Walk-ins"]) else "no footfall counted"),
                 ("WhatsApp Conversion", _pct(r["WhatsApp Conversion %"]),
-                 f"{r['WhatsApp Converted']:,.0f} of {r['WhatsApp Chats']:,.0f} chats"
-                 if pd.notna(r["WhatsApp Chats"]) else "no chats logged"),
+                 f"{r['WhatsApp Chats']:,.0f} chats" if pd.notna(r["WhatsApp Chats"])
+                 else "no chats logged"),
                 ("Response Time", "—" if pd.isna(r["Response Time (min)"])
                  else f"{r['Response Time (min)']:.1f} min",
                  f"target {scorecards.RESPONSE_TARGET_MIN} min"),
                 ("Customer Feedback", _pct(r["Feedback %"]),
-                 f"{r['Feedback']:,.0f} customers · {r.get('Forms Received', 0):,.0f} forms named the shop"
-                 if pd.notna(r["Feedback"]) else None),
-                ("Training Completion", _pct(r["Training Completion %"]),
-                 f"average score {_pct(r['Training %'])}"),
-                ("Protect Stock", "—" if pd.isna(r["Stock Variance %"])
-                 else f"{r['Stock Variance %']:.1f}% variance",
-                 f"last count {pd.Timestamp(r['Last Stock Count']):%d %b}"
-                 if pd.notna(r["Last Stock Count"]) else "no stock count"),
+                 f"target {scorecards.FEEDBACK_TARGET}%"),
+                ("Training Plan", _pct(r["Training Completion %"]), "answers due, answered"),
+                ("Stock Accuracy", "—" if pd.isna(r["Stock Variance %"])
+                 else f"{r['Stock Variance %']:.2f}% variance",
+                 f"{r['Stock Counts']:,.0f} count{'s' if r['Stock Counts'] != 1 else ''}"
+                 if pd.notna(r.get("Stock Counts")) else "no stock count"),
             ], scorecards.HEAD_MEASURES)
         matching = data.get("feedback_matching")
         if matching is not None:
@@ -1141,7 +1154,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         f"corporate orders and orders of {scorecards.BULK_MIN_BAGS}+ bags, against "
         f"{scorecards.BULK_SHARE:.0%} of their target. **Conversion** is their walk-in orders "
         "over the customers they served — the shop's walk-ins each floor day split between "
-        "everyone serving walk-ins that day — against the network's rate. **New products** is "
+        "everyone serving walk-ins that day; the rate is the score. **New products** is "
         "the share of their sales from bags Odoo flags as new, against the network's share. "
         "**Respond fast** is the shop's WhatsApp chats answered within "
         f"{scorecards.RESPONSE_TARGET_MIN} min on their WhatsApp days. **Customer service** is "

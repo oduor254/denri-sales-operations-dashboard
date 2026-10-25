@@ -6,15 +6,15 @@ capped at 100 — and a card's score is the weighted average of its measures:
   Shop Manager (the shop's Head on its POS in Odoo)          weight
     Hit shop target         revenue / the shop's daily targets      30
     Basket value            revenue per order / KES 3,200           10
-    Convert walk-ins        walk-in orders / walk-ins (footfall),
-                            against the network's rate              10
+    Convert walk-ins        walk-in orders / walk-ins (footfall);
+                            the rate is the score (87.9% scores 88) 10
     Convert WhatsApp leads  WhatsApp chats that bought / chats,
                             against the network's rate              10
     Response time           average first WhatsApp reply / 3 min     7
     Customer feedback       customers sending a form / 70%           8
     Training completion     the team's questionnaires answered       10
-    Protect stock           stock-count variance: 0% scores 100,
-                            10% or more off scores 0                 10
+    Protect stock           100 minus the stock-count variance
+                            (11.67% off scores 88)                   10
 
   Shop Attendant / BA
     Hit personal target     own sales / their daily target shares   30
@@ -22,8 +22,8 @@ capped at 100 — and a card's score is the weighted average of its measures:
     Grow the basket         own revenue per order / KES 3,200       10
     Sale of new products    share of own sales from new bags,
                             against the network's share              4
-    Conversion              own walk-in orders / customers served,
-                            against the network's rate              15
+    Conversion              own walk-in orders / customers served;
+                            the rate is the score                   15
     Respond fast            the shop's WhatsApp chats answered
                             within 3 min, on their WhatsApp days    10
     Customer service        average staff rating (1-5) from the
@@ -75,14 +75,13 @@ CORPORATE_SHARE = 0.10          # corporate sales expected as a share of the tar
 BULK_SHARE = 0.10               # bulk sales expected as a share of the target
 BULK_MIN_BAGS = 5               # an order of this many bags or more is a bulk order
 RESPONSE_TARGET_MIN = 3         # minutes to the first WhatsApp reply
-STOCK_VARIANCE_ZERO_AT = 10.0   # stock-count variance % that scores 0
 LATE_CREDIT = 0.5               # a late day counts half towards Be There
 
 #   (score column, value column — already a % of target, weight)
 HEAD_MEASURES = [
     ("Shop Target Score", "Target %", 30),
     ("Basket Value Score", "Basket Value %", 10),
-    ("Walk-in Conversion Score", "Walk-in Conversion vs Network %", 10),
+    ("Walk-in Conversion Score", "Walk-in Conversion %", 10),
     ("WhatsApp Conversion Score", "WhatsApp Conversion vs Network %", 10),
     ("Response Score", "Response vs Target %", 7),
     ("Feedback Score", "Feedback of Target %", 8),
@@ -94,7 +93,7 @@ ATTENDANT_MEASURES = [
     ("Bulk Orders Score", "Bulk %", 5),
     ("Basket Score", "Basket Value %", 10),
     ("New Products Score", "New Products vs Network %", 4),
-    ("Conversion Score", "Conversion vs Network %", 15),
+    ("Conversion Score", "Conversion %", 15),
     ("Respond Fast Score", "Fast Reply %", 10),
     ("Service Score", "Service %", 7),
     ("Feedback Score", "Feedback of Target %", 4),
@@ -467,10 +466,11 @@ def shop_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataF
         variance = (s["Variance Qty"] / s["System Qty"].where(s["System Qty"] > 0) * 100)
         table["Stock Variance %"] = variance.reindex(table.index).round(2)
         table["Last Stock Count"] = s["Last Count"].reindex(table.index)
-        table["Stock Accuracy %"] = (100 - table["Stock Variance %"] * 100 / STOCK_VARIANCE_ZERO_AT
-                                     ).clip(lower=0).round(1)
+        table["Stock Counts"] = s["Counts"].reindex(table.index)
+        table["Stock Accuracy %"] = (100 - table["Stock Variance %"]).clip(lower=0).round(1)
     else:
         table["Stock Variance %"] = table["Last Stock Count"] = table["Stock Accuracy %"] = np.nan
+        table["Stock Counts"] = np.nan
 
     table["Head"] = (heads.set_index("Location")["Head"].reindex(table.index)
                      if heads is not None and not heads.empty else None)
