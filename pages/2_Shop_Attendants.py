@@ -735,7 +735,8 @@ def _display_weights(measures: list) -> dict:
     return {m[0]: m[2] for m in measures}
 
 
-def _card(title: str, row: pd.Series, items: list, measures: list) -> None:
+def _card(title: str, row: pd.Series, items: list, measures: list,
+          helps: list[str] | None = None) -> None:
     """One score card: the weighted score and the share of the weights it
     stands on, then each measure — its weight in the label, and under its
     value the score it got and the points that earns (score × weight).
@@ -756,6 +757,7 @@ def _card(title: str, row: pd.Series, items: list, measures: list) -> None:
         for i, item in enumerate(items):
             name, value, note = item[:3]
             column = item[3] if len(item) > 3 else (columns[i] if len(items) == len(columns) else None)
+            tip = helps[i] if helps and i < len(helps) else None
             if column in weights:
                 weight = weights[column]
                 shown = f"{weight:.0f}" if float(weight).is_integer() else f"{weight:.1f}"
@@ -764,10 +766,16 @@ def _card(title: str, row: pd.Series, items: list, measures: list) -> None:
                 tail = (f"score {score:.0f} · {score * weight / 100:.1f} of {shown} pts"
                         if pd.notna(score) else "no data · left out")
                 note = f"{note} · {tail}" if note else tail
-            cells.append((name, value, note))
+                if tip:
+                    tip += ("  \n**Score:** " + (f"{score:.0f}/100 × {shown}% weight = "
+                                                 f"**{score * weight / 100:.1f} pts**"
+                                                 if pd.notna(score) else
+                                                 "no data this period, so it is left out and "
+                                                 "the other weights scaled up"))
+            cells.append((name, value, note, tip))
         for start in range(0, len(cells), 4):
-            for col, (name, value, note) in zip(st.columns(4), cells[start:start + 4]):
-                col.metric(name, value, note, delta_color="off")
+            for col, (name, value, note, tip) in zip(st.columns(4), cells[start:start + 4]):
+                col.metric(name, value, note, delta_color="off", help=tip)
 
 
 def _money(v) -> str:
@@ -1035,7 +1043,7 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
             ("WhatsApp Response", "—" if pd.isna(r["Response Time (min)"])
              else f"{r['Response Time (min)']:.1f} min",
              f"target {scorecards.RESPONSE_TARGET_MIN} min"),
-        ], scorecards.SHOP_MEASURES)
+        ], scorecards.SHOP_MEASURES, helps=_shop_helps(r, basket))
     with st.container(border=True):
         st.caption("All shops side by side, best weighted score first, with each measure's score "
                    "and the figures behind it.")
@@ -1045,6 +1053,149 @@ def _shop_cards_view(data: dict, location: str, due: str, basket: str) -> None:
                                                 "Corporate Target", "Basket Value",
                                                 "Revenue per Attendant"),
                               total=False, height=460)
+
+
+def _n(v, fmt: str = ",.0f", unit: str = "") -> str:
+    """A number for a tooltip, or — when missing."""
+    return "—" if v is None or pd.isna(v) else f"{v:{fmt}}{unit}"
+
+
+def _tip(what: str, *lines: str) -> str:
+    """A KPI tooltip: what it measures, then its figures, one per line."""
+    return "  \n".join([what] + [line for line in lines if line])
+
+
+def _head_helps(r: pd.Series, basket: str) -> list[str]:
+    """Tooltips for a shop manager card, in the order of its KPIs."""
+    rt = scorecards.RESPONSE_TARGET_MIN
+    return [
+        _tip("**Hit shop target** — the shop's sales against its daily targets for the days so far.",
+             f"Target: **{_money(r['Target'])}**",
+             f"Achieved: **{_money(r['Revenue'])}** from {_n(r['Orders'])} orders",
+             f"Achievement: **{_pct(r['Target %'])}** (100% or more scores 100)"),
+        _tip("**Basket value** — average spend per order (revenue ÷ orders).",
+             f"Revenue {_money(r['Revenue'])} ÷ {_n(r['Orders'])} orders = **{_money(r['Basket Value'])}**",
+             f"Target: **{basket}** per order → {_pct(r['Basket Value %'])} of target"),
+        _tip("**Convert walk-ins** — the share of people who walked in that bought (footfall "
+             "module, the Reporting sheet filling gaps).",
+             f"Walk-ins counted: **{_n(r['Walk-ins'])}**",
+             f"Walk-in orders: **{_n(r['Walk-in Orders'])}**",
+             f"Conversion: **{_pct(r['Walk-in Conversion %'])}** — the rate is the score"),
+        _tip("**Convert WhatsApp leads** — WhatsApp chats (WhatsApp Monitor) that ended in a purchase.",
+             f"Chats: **{_n(r['WhatsApp Chats'])}** · bought: **{_n(r['WhatsApp Converted'])}**",
+             f"Conversion: **{_pct(r['WhatsApp Conversion %'])}**, scored against the network's "
+             "rate (at or above it scores 100)"),
+        _tip("**Response time** — the average time to the first reply on WhatsApp chats.",
+             f"Average first reply: **{_n(r['Response Time (min)'], '.1f', ' min')}** over "
+             f"{_n(r['Chats'])} answered chats",
+             f"Target: **{rt} min** or quicker scores 100; twice as slow scores 50"),
+        _tip("**Customer feedback** — customers served who sent a feedback form about their purchase.",
+             f"Customers served: **{_n(r['Customers'])}** · gave feedback: **{_n(r['Feedback'])}**",
+             f"Forms naming the shop in the period: {_n(r.get('Forms Received'))}"
+             f" (matched to a sale: {_n(r.get('Forms Matched'))})",
+             f"Rate: **{_pct(r['Feedback %'])}** against a target of "
+             f"**{scorecards.FEEDBACK_TARGET}%**"),
+        _tip("**Training plan completion** — the team's daily sales-training questionnaires answered.",
+             f"Answered: **{_pct(r['Training Completion %'])}** of the questionnaires due",
+             f"Team's average score (missed = 0): {_pct(r['Training %'])}"),
+        _tip("**Protect stock** — how far the shop's stock counts were off the system quantity.",
+             f"Counts: **{_n(r.get('Stock Counts'))}** · last: "
+             + (f"{pd.Timestamp(r['Last Stock Count']):%d %b}" if pd.notna(r.get("Last Stock Count")) else "—"),
+             f"Variance: **{_n(r['Stock Variance %'], '.2f', '%')}** of units counted",
+             "Scoring rule: 100 minus the variance (12% off scores 88)"),
+    ]
+
+
+def _shop_helps(r: pd.Series, basket: str) -> list[str]:
+    """Tooltips for a shop card, in the order of its KPIs."""
+    rt = scorecards.RESPONSE_TARGET_MIN
+    return [
+        _tip("**Revenue** — the shop's sales against its daily targets for the days so far.",
+             f"Target: **{_money(r['Target'])}** · achieved: **{_money(r['Revenue'])}**",
+             f"Achievement: **{_pct(r['Target %'])}**"),
+        _tip("**Corporate revenue** — sales to customers recorded as Corporate.",
+             f"Achieved: **{_money(r['Corporate Revenue'])}**",
+             f"Target: **{_money(r['Corporate Target'])}** "
+             f"({scorecards.CORPORATE_SHARE:.0%} of the revenue target) → {_pct(r['Corporate %'])}"),
+        _tip("**Basket value** — average spend per order.",
+             f"Revenue {_money(r['Revenue'])} ÷ {_n(r['Orders'])} orders = **{_money(r['Basket Value'])}**",
+             f"Target: **{basket}** → {_pct(r['Basket Value %'])}"),
+        _tip("**Basket size** — bags per order. No target: ranked against the other shops "
+             "(100 = best shop).",
+             f"Bags: **{_n(r['Bags'])}** over {_n(r['Orders'])} orders = **{_n(r['Basket Size'], '.2f')}** a bag"),
+        _tip("**Repeat purchase** — customers who bought on two or more different days in the "
+             "period. Ranked against the other shops.",
+             f"Customers: **{_n(r['Customers'])}** · repeat rate: **{_pct(r['Repeat %'])}**"),
+        _tip("**Retention** — last period's customers who came back to buy at the same shop. "
+             "Ranked against the other shops.",
+             f"Last period's customers: **{_n(r['Previous Customers'])}** · came back: "
+             f"**{_n(r['Retained'])}** → {_pct(r['Retention %'])}"),
+        _tip("**Customer feedback** — customers served who sent a feedback form about their purchase.",
+             f"Customers: **{_n(r['Customers'])}** · gave feedback: **{_n(r['Feedback'])}** "
+             f"→ {_pct(r['Feedback %'])}",
+             f"Target: **{scorecards.FEEDBACK_TARGET}%**"),
+        _tip("**Sales training** — the team's daily questionnaires, each at the score it got and "
+             "a missed one at 0.",
+             f"Average: **{_pct(r['Training %'])}** · answered: {_pct(r.get('Training Completion %'))}",
+             "Target: **100%**"),
+        _tip("**WhatsApp response** — average time to the first reply on WhatsApp chats.",
+             f"Average: **{_n(r['Response Time (min)'], '.1f', ' min')}** over {_n(r['Chats'])} chats",
+             f"Target: **{rt} min** or quicker scores 100"),
+    ]
+
+
+def _attendant_helps(r: pd.Series, basket: str) -> list[str]:
+    """Tooltips for an attendant card, in the order of its KPIs."""
+    return [
+        _tip("**Hit personal target** — their own sales against their share of the shop's daily "
+             "targets (each day split equally between everyone working that day).",
+             f"Days worked: **{_n(r['Days Worked'])}** · average team on the floor: "
+             f"{_n(r['Avg Team'], '.1f')}",
+             f"Target: **{_money(r['Target'])}** · achieved: **{_money(r['Revenue'])}**",
+             f"Achievement: **{_pct(r['Target %'])}**"),
+        _tip(f"**Bulk orders** — corporate orders and orders of {scorecards.BULK_MIN_BAGS}+ bags.",
+             f"Bulk sales: **{_money(r['Bulk Revenue'])}**",
+             f"Target: **{_money(r['Bulk Target'])}** ({scorecards.BULK_SHARE:.0%} of their "
+             f"target) → {_pct(r['Bulk %'])}"),
+        _tip("**Grow the basket** — their average spend per order.",
+             f"Sales {_money(r['Revenue'])} ÷ {_n(r['Orders'])} orders = **{_money(r['Basket Value'])}**",
+             f"Target: **{basket}** → {_pct(r['Basket Value %'])}"),
+        _tip("**Sale of new products** — the share of their sales from bags Odoo flags as new.",
+             f"New-bag sales: **{_money(r['New Bag Revenue'])}** = **{_pct(r['New Products %'])}** "
+             "of their sales",
+             "Scored against the network's share (at or above it scores 100)"),
+        _tip("**Customer target** — customers (orders) served against the customers expected: "
+             "each day's shop target ÷ the shop's average spend per customer (the 30 days "
+             "before, bulk orders left out), shared between everyone working that day.",
+             f"Average spend per customer: **{_money(r['Avg Spend per Customer'])}**",
+             f"Expected: **{_n(r['Expected Customers'])}** · served: **{_n(r['Orders'])}**",
+             f"Achievement: **{_pct(r['Customer Target %'])}**"),
+        _tip(f"**Respond fast** — the shop's WhatsApp chats answered within "
+             f"{scorecards.RESPONSE_TARGET_MIN} minutes, on the days they were on WhatsApp "
+             "(served the shop's online orders).",
+             f"WhatsApp days: **{_n(r['WhatsApp Days'])}** · chats answered: "
+             f"**{_n(r['Chats Answered'])}**",
+             f"Within {scorecards.RESPONSE_TARGET_MIN} min: **{_pct(r['Fast Reply %'])}**"),
+        _tip("**Excellent customer service** — the staff rating (1–5) on the feedback forms of "
+             "customers they served.",
+             f"Ratings: **{_n(r['Ratings'])}** · average: **{_n(r['Service Rating'], '.2f', ' / 5')}**",
+             "Scoring rule: the average out of 5, as a percentage"),
+        _tip("**Customer feedback** — customers they served who sent a feedback form about the purchase.",
+             f"Customers served: **{_n(r['Customers'])}** · gave feedback: **{_n(r['Feedback'])}** "
+             f"→ {_pct(r['Feedback %'])}",
+             f"Target: **{scorecards.FEEDBACK_TARGET}%**"),
+        _tip("**Capture the customer** — their orders with the customer's real phone number in Odoo.",
+             f"Captured: **{_n(r['Captured Orders'])}** of {_n(r['Orders'])} orders "
+             f"→ {_pct(r['Capture %'])}"),
+        _tip("**Know the product** — their daily sales-training questionnaires, each at the "
+             "score it got and a missed one at 0.",
+             f"Training score: **{_pct(r['Training %'])}**",
+             "" if pd.notna(r["Training %"]) else "Not matched to the training team list by name"),
+        _tip(f"**Be there** — on time on the days they worked (a late day counts "
+             f"{scorecards.LATE_CREDIT:.0%}), from clock-ins.",
+             f"Attendance: **{_pct(r['Attendance %'])}** · late days: {_n(r['Late Days'])}",
+             "" if pd.notna(r["Attendance %"]) else "No clock-ins in the period"),
+    ]
 
 
 def _weights_text(measures: list) -> str:
@@ -1127,7 +1278,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
                  else f"{r['Stock Variance %']:.2f}% variance",
                  f"{r['Stock Counts']:,.0f} count{'s' if r['Stock Counts'] != 1 else ''}"
                  if pd.notna(r.get("Stock Counts")) else "no stock count"),
-            ], scorecards.HEAD_MEASURES)
+            ], scorecards.HEAD_MEASURES, helps=_head_helps(r, basket))
         matching = data.get("feedback_matching")
         if matching is not None:
             with st.expander("Customer feedback: forms received vs matched to a sale"):
@@ -1210,7 +1361,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
             ("Be There", _pct(r["Attendance %"]),
              f"{r['Late Days']:,.0f} late day(s)" if pd.notna(r["Attendance %"])
              else "no clock-ins"),
-        ], scorecards.ATTENDANT_MEASURES)
+        ], scorecards.ATTENDANT_MEASURES, helps=_attendant_helps(r, basket))
     if person == ALL_PEOPLE and len(people) > 12:
         st.caption(f"The 12 best weighted scores are shown as cards; all {len(people)} are in "
                    "the table. Pick a person at the top to see their card.")
