@@ -22,8 +22,10 @@ capped at 100 — and a card's score is the weighted average of its measures:
     Grow the basket         own revenue per order / KES 3,200       10
     Sale of new products    share of own sales from new bags,
                             against the network's share              4
-    Conversion              own walk-in orders / customers served;
-                            the rate is the score                   15
+    Customer target         customers served (orders) / customers
+                            expected: each day's target / the
+                            shop's average spend per customer,
+                            shared between those on the floor       15
     Respond fast            the shop's WhatsApp chats answered
                             within 3 min, on their WhatsApp days    10
     Customer service        average staff rating (1-5) from the
@@ -93,7 +95,7 @@ ATTENDANT_MEASURES = [
     ("Bulk Orders Score", "Bulk %", 5),
     ("Basket Score", "Basket Value %", 10),
     ("New Products Score", "New Products vs Network %", 4),
-    ("Conversion Score", "Conversion %", 15),
+    ("Customer Target Score", "Customer Target %", 15),
     ("Respond Fast Score", "Fast Reply %", 10),
     ("Service Score", "Service %", 7),
     ("Feedback Score", "Feedback of Target %", 4),
@@ -493,11 +495,28 @@ def shop_overall(shops: pd.DataFrame) -> pd.DataFrame:
     return weighted(shops, SHOP_MEASURES).sort_values("Score", ascending=False)
 
 
+CUSTOMER_SPEND_DAYS = 30    # average spend per customer is taken over the 30 days before
+
+
+def average_spend(orders: pd.DataFrame) -> pd.Series:
+    """Each shop's average spend per customer (revenue per order), from the
+    orders given — the 30 days before the period, so the customer target is
+    fixed before it starts and can't move with the period's own sales. Bulk
+    and corporate orders are left out: one large corporate order would make
+    the average far higher and the customers expected far fewer."""
+    if orders is None or orders.empty:
+        return pd.Series(dtype=float)
+    bulk = orders["Corporate"].fillna(False).astype(bool) | (orders["Bags"] >= BULK_MIN_BAGS)
+    g = orders[~bulk].groupby("Location")["Revenue"]
+    return (g.sum() / g.size()).round(0)
+
+
 def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.DataFrame,
                     training: pd.Series | None = None, *,
                     walkins: pd.DataFrame | None = None,
                     wa: pd.DataFrame | None = None,
-                    attendance: pd.DataFrame | None = None) -> pd.DataFrame:
+                    attendance: pd.DataFrame | None = None,
+                    avg_spend: pd.Series | None = None) -> pd.DataFrame:
     """One row per attendant or BA (per shop they served at).
 
     Day by day: the shop's daily target is shared equally between everyone
@@ -514,6 +533,12 @@ def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.
     worked = (staffed[["Location", "Day", "Served By"]].drop_duplicates()
               .join(team, on=["Location", "Day"]).join(day_target, on=["Location", "Day"]))
     worked["Target Share"] = worked["Day Target"] / worked["Team"]
+    # Customer target: the day's target over the shop's average spend per
+    # customer is the customers the shop needs that day, shared the same way.
+    spend = avg_spend if avg_spend is not None else pd.Series(dtype=float)
+    worked["Avg Spend"] = worked["Location"].map(spend)
+    worked["Customer Share"] = (worked["Day Target"] / worked["Avg Spend"].where(worked["Avg Spend"] > 0)
+                                / worked["Team"])
     g = staffed.groupby(keys)
     by_person = worked.groupby(keys)
     bulk = staffed["Corporate"] | (staffed["Bags"] >= BULK_MIN_BAGS)
@@ -528,6 +553,8 @@ def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.
         "Bulk Revenue": staffed[bulk].groupby(keys)["Revenue"].sum(),
         "New Bag Revenue": g["New Bag Revenue"].sum() if "New Bag Revenue" in staffed else np.nan,
         "Captured Orders": g["Captured"].sum(),
+        "Expected Customers": by_person["Customer Share"].sum(min_count=1).round(1),
+        "Avg Spend per Customer": by_person["Avg Spend"].first(),
     })
     for col in ("Corporate Revenue", "Bulk Revenue"):
         table[col] = table[col].fillna(0)
@@ -540,6 +567,7 @@ def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.
     table["Corporate %"] = _pct(table["Corporate Revenue"], table["Corporate Target"])
     table["Bulk Target"] = (table["Target"] * BULK_SHARE).round(0)
     table["Bulk %"] = _pct(table["Bulk Revenue"], table["Bulk Target"])
+    table["Customer Target %"] = _pct(table["Orders"], table["Expected Customers"])
 
     # New products: share of own sales from new bags, against the network's.
     table["New Products %"] = _pct(table["New Bag Revenue"], table["Revenue"])
@@ -548,8 +576,9 @@ def attendant_cards(df: pd.DataFrame, previous: pd.DataFrame, daily_targets: pd.
     table["New Products vs Network %"] = ((table["New Products %"] / net_new * 100).round(1)
                                           if net_new else np.nan)
 
-    # Conversion: walk-in orders over customers served — the shop's walk-ins
-    # that day split between everyone serving walk-ins that day.
+    # Conversion (shown, not scored — Customer Target replaced it): walk-in
+    # orders over the shop's walk-ins each day split between everyone
+    # serving walk-ins that day.
     walk = _walkins_by_shop_day(walkins)
     network = _network_conversion(df, walk)
     floor = staffed[staffed["Order Type"] == "walkin"]

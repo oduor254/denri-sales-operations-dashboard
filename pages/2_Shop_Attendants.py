@@ -249,6 +249,7 @@ SCORE_PEOPLE_COLUMNS = (["Attendant / BA", "Location", "Score", "Weight Covered 
                         + ["Days Worked", "Avg Team", "Target", "Revenue", "Target %",
                            "Bulk Revenue", "Bulk Target", "Bulk %", "Orders", "Basket Value",
                            "Basket Value %", "New Bag Revenue", "New Products %",
+                           "Expected Customers", "Avg Spend per Customer", "Customer Target %",
                            "Customers Served", "Walk-in Orders", "Conversion %",
                            "WhatsApp Days", "Chats Answered", "Fast Reply %",
                            "Service Rating", "Ratings", "Customers", "Feedback", "Feedback %",
@@ -339,7 +340,7 @@ def _build_report(df: pd.DataFrame, shown: pd.DataFrame, per: pd.DataFrame,
                               + ". Measures a person had no part in are left out and the rest "
                                 "scaled up to 100% (Weight Covered %).",
                          doc_columns=["Attendant / BA", "Location", "Score", "Weight Covered %",
-                                      "Personal Target Score", "Basket Score", "Conversion Score",
+                                      "Personal Target Score", "Basket Score", "Customer Target Score",
                                       "Respond Fast Score", "Service Score", "Training Score"]),
         ]
         notes = [n for n in (data["feedback_note"], data["training_note"]) if n]
@@ -948,9 +949,13 @@ def _scorecard_data(start_date: date, end_date: date) -> dict | None:
         df, previous, day_targets, shop_training, _response_times(chats),
         training_completion=completion, walkins=walkins, wa=chats,
         stock=_optional(queries.STOCK_COUNTS, params), heads=_optional(queries.SHOP_HEADS))
+    spend_orders = db.run_query(queries.SCORECARD_ORDERS, {
+        "start_date": start_date - timedelta(days=scorecards.CUSTOMER_SPEND_DAYS),
+        "end_date": start_date - timedelta(days=1)})
+    avg_spend = scorecards.average_spend(scorecards.prepare(spend_orders, not_customers))
     people = scorecards.attendant_cards(
         df, previous, day_targets, person_training, walkins=walkins, wa=chats,
-        attendance=_optional(queries.ATTENDANCE_DAYS, params))
+        attendance=_optional(queries.ATTENDANCE_DAYS, params), avg_spend=avg_spend)
     matching = _feedback_matching(shops, df, matches, responses, start_date, end_date)
     return {"shops": shops, "shop_cards": scorecards.shop_overall(shops), "people": people,
             "basis": basis, "prev_start": prev_start, "prev_end": prev_end,
@@ -1156,9 +1161,11 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         "everyone serving that day (a KES 100,000 day with two people gives each 50,000), "
         "summed over their days; the % is their own sales over it. **Bulk orders** are "
         f"corporate orders and orders of {scorecards.BULK_MIN_BAGS}+ bags, against "
-        f"{scorecards.BULK_SHARE:.0%} of their target. **Conversion** is their walk-in orders "
-        "over the customers they served — the shop's walk-ins each floor day split between "
-        "everyone serving walk-ins that day; the rate is the score. **New products** is "
+        f"{scorecards.BULK_SHARE:.0%} of their target. **Customer target** is the customers "
+        "(orders) they served against the customers expected of them: each day's shop target "
+        "divided by the shop's average spend per customer — over the "
+        f"{scorecards.CUSTOMER_SPEND_DAYS} days before the period, bulk and corporate orders "
+        "left out — shared between everyone working that day. **New products** is "
         "the share of their sales from bags Odoo flags as new, against the network's share. "
         "**Respond fast** is the shop's WhatsApp chats answered within "
         f"{scorecards.RESPONSE_TARGET_MIN} min on their WhatsApp days. **Customer service** is "
@@ -1184,9 +1191,9 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
             ("Basket Value", _money(r["Basket Value"]),
              f"{_pct(r['Basket Value %'])} of {basket}"),
             ("New Products", _pct(r["New Products %"]), "of their sales"),
-            ("Conversion", _pct(r["Conversion %"]),
-             f"{r['Walk-in Orders']:,.0f} of {r['Customers Served']:,.0f} served"
-             if pd.notna(r["Customers Served"]) else "no floor days with footfall"),
+            ("Customer Target", f"{int(r['Orders']):,} customers",
+             f"of {r['Expected Customers']:,.0f} expected at {_money(r['Avg Spend per Customer'])} each"
+             if pd.notna(r["Expected Customers"]) else "no target or average spend"),
             ("Respond Fast", _pct(r["Fast Reply %"]),
              f"{r['WhatsApp Days']:,.0f} WhatsApp day(s)" if pd.notna(r["WhatsApp Days"])
              else "not on WhatsApp"),
@@ -1211,6 +1218,7 @@ def _score_cards(start_date: date, end_date: date, location: str, person: str) -
         grid.filterable_table(people[SCORE_PEOPLE_COLUMNS], pinned_columns=("Attendant / BA",),
                               currency_columns=("Target", "Revenue", "Revenue per Day",
                                                 "Bulk Revenue", "Bulk Target", "New Bag Revenue",
+                                                "Avg Spend per Customer",
                                                 "Corporate Revenue", "Basket Value"),
                               total=False, height=460)
 
