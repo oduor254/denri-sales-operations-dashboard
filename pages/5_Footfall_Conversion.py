@@ -229,6 +229,93 @@ if location == ALL and not channels.empty:
                + f" — KES {now['Revenue'] + parts.sum():,.0f} with them.")
 
 
+# --- Shop by day: the workbook's "Revenue Sales" sheet -----------------------
+def _shop_day_grid() -> None:
+    """Every day of the period down the side and every shop across — sales,
+    % of its daily target, walk-ins, bought and conversion — with the
+    network summary, the channels without walk-ins and the daily total on the
+    right, a subtotal per week and a total at the bottom. The layout of the
+    weekly "Sales vs Conversion Rate" workbook's Revenue Sales sheet."""
+    data = _mine(current)
+    if data.empty:
+        return
+    order = [s for s in shops if s in set(data["Shop"])]
+    channel_rows = ff.other_channels(rev, system, start, end) if location == ALL else None
+
+    def figures(rows: pd.DataFrame, extra: pd.DataFrame | None) -> dict:
+        out = {}
+        for shop in order:
+            r = rows[rows["Shop"] == shop]
+            sales, target = r["Revenue"].sum(), r["Target"].sum(min_count=1)
+            walk, bought = r["Walk-ins"].sum(), r["Purchased"].sum()
+            counted = r["Counted Purchased"].sum()
+            out[f"{shop}|Sales"] = sales if not r.empty else None
+            out[f"{shop}|Rate"] = sales / target * 100 if target and target > 0 else None
+            out[f"{shop}|Walk-ins"] = walk if walk else None
+            out[f"{shop}|Bought"] = bought if not r.empty else None
+            out[f"{shop}|Conversion"] = counted / walk * 100 if walk else None
+        sales, target = rows["Revenue"].sum(), rows["Target"].sum(min_count=1)
+        walk, counted = rows["Walk-ins"].sum(), rows["Counted Purchased"].sum()
+        out["Total|Sales"] = sales
+        out["Total|Rate"] = sales / target * 100 if target and target > 0 else None
+        out["Total|Walk-ins"] = walk or None
+        out["Total|Bought"] = rows["Purchased"].sum()
+        out["Total|Conversion"] = counted / walk * 100 if walk else None
+        channels_total = 0.0
+        for name in ff.OTHER_CHANNELS:
+            v = extra[extra["Shop"] == name]["Revenue"].sum() if extra is not None else 0.0
+            out[f"Channel|{name}"] = v
+            channels_total += v
+        out["Daily Total|Sales"] = sales + channels_total
+        return out
+
+    lines = []
+    days = sorted(data["Date"].unique())
+    weeks: dict[int, list] = {}
+    for d in days:
+        weeks.setdefault(ff.week_number(d), []).append(d)
+    pick = lambda frame, ds: frame[frame["Date"].isin(ds)] if frame is not None else None
+    for week, week_days in weeks.items():
+        for d in week_days:
+            lines.append({"Week": f"Week {week}", "Date": f"{d:%a %d %b}",
+                          **figures(pick(data, [d]), pick(channel_rows, [d]))})
+        if len(weeks) > 1 or len(week_days) > 1:
+            lines.append({"Week": f"Week {week} Total", "Date": "",
+                          **figures(pick(data, week_days), pick(channel_rows, week_days))})
+    if len(weeks) > 1:
+        lines.append({"Week": "Period Total", "Date": "", **figures(data, channel_rows)})
+    table = pd.DataFrame(lines)
+
+    latest = data.dropna(subset=["Target"]).sort_values("Date").groupby("Shop")["Target"].last()
+    groups = [(None, [("Week", "Week", "text")]), (None, [("Date", "Date", "text")])]
+    for shop in order:
+        head = (f"{shop} · target KES {latest[shop]:,.0f}/day" if shop in latest.index else shop)
+        groups.append((head, [(f"{shop}|Sales", "Sales", "money"), (f"{shop}|Rate", "Rate", "pct"),
+                              (f"{shop}|Walk-ins", "Walk-ins", "int"),
+                              (f"{shop}|Bought", "Bought", "int"),
+                              (f"{shop}|Conversion", "Conversion", "pct")]))
+    groups.append(("Summary — shops" if location == ALL else f"Summary — {location}",
+                   [("Total|Sales", "Total Sales", "money"), ("Total|Rate", "% of Target", "pct"),
+                    ("Total|Walk-ins", "Total Walk-ins", "int"), ("Total|Bought", "Bought", "int"),
+                    ("Total|Conversion", "Conversion", "pct")]))
+    if location == ALL:
+        groups.append(("No walk-ins", [(f"Channel|{n}", n, "money") for n in ff.OTHER_CHANNELS]))
+        groups.append(("Daily Total", [("Daily Total|Sales", "All Sales", "money")]))
+
+    st.subheader("Sales & Conversion by Shop and Day")
+    st.caption("The weekly Sales vs Conversion workbook's Revenue Sales sheet: each shop's sales, "
+               "the % of its daily target (Rate), walk-ins, how many bought and the conversion, "
+               "day by day, with the shops' summary, the channels without walk-ins and the "
+               "day's total on the right. Week subtotals and the period total are worked out on "
+               "the sums. Scroll sideways for every shop; Date and Week stay put.")
+    with st.container(border=True):
+        grid.grouped_table(table, groups, pinned=2, bold_rows="Total",
+                           height=min(120 + 34 * len(table), 640), key="footfall_shop_day")
+
+
+_shop_day_grid()
+
+
 # --- Daily sales vs conversion ------------------------------------------------
 daily = ff.summarise(_mine(current), ["Date"]).sort_values("Date")
 with st.container(border=True):

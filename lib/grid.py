@@ -125,3 +125,54 @@ def filterable_table(
         show_search=True,
         show_download_button=True,
     )
+
+
+_FORMATS = {
+    "money": "Number(v).toLocaleString(undefined, {maximumFractionDigits: 0})",
+    "int": "Number(v).toLocaleString(undefined, {maximumFractionDigits: 0})",
+    "pct": "Number(v).toFixed(1) + '%'",
+}
+
+
+def grouped_table(df: pd.DataFrame, groups: list[tuple[str | None, list[tuple[str, str, str]]]],
+                  *, height: int = 520, pinned: int = 0, bold_rows: str | None = None,
+                  key: str | None = None) -> None:
+    """A wide, spreadsheet-style grid with grouped column headers — a shop
+    name over its Sales / Rate / Walk-ins / Bought / Conversion columns, as
+    in the weekly Sales vs Conversion workbook.
+
+    groups is [(group header or None, [(column in df, header, kind), ...])],
+    kind one of money / int / pct / text. The first `pinned` columns stay put
+    while the rest scroll sideways. Rows whose first column contains
+    `bold_rows` (e.g. "Total") are drawn bold.
+    """
+    safe = {}
+    defs = []
+    for group, cols in groups:
+        children = []
+        for col, header, kind in cols:
+            field = f"c{len(safe)}"
+            safe[col] = field
+            child = {"field": field, "headerName": header, "sortable": False,
+                     "resizable": True, "minWidth": 96 if kind != "text" else 120}
+            if kind in _FORMATS:
+                child["type"] = ["numericColumn"]
+                child["valueFormatter"] = JsCode(
+                    "function(p) { var v = p.value; if (v === null || v === undefined || "
+                    f"Number.isNaN(v)) return ''; return {_FORMATS[kind]}; }}")
+            if len(safe) <= pinned:
+                child["pinned"] = "left"
+            children.append(child)
+        defs.append({"headerName": group, "children": children} if group else children[0])
+    data = _stringify_dates(df[list(safe)].rename(columns=safe))
+    options = {"columnDefs": defs, "defaultColDef": {"suppressMovable": True},
+               "enableCellTextSelection": True, "ensureDomOrder": True,
+               "suppressColumnVirtualisation": False}
+    if bold_rows:
+        first = next(iter(safe.values()))
+        options["getRowStyle"] = JsCode(
+            "function(p) { var v = String(p.data['" + first + "'] || ''); if (v.indexOf('"
+            + bold_rows + "') !== -1) return {fontWeight: 'bold', "
+            "background: 'rgba(57,135,229,0.10)'}; }")
+    AgGrid(data, gridOptions=options, height=height, allow_unsafe_jscode=True,
+           show_toolbar=True, show_download_button=True, key=key)
